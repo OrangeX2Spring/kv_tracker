@@ -1,0 +1,6 @@
+[submodule "thirdparty/Pi3"]
+	path = thirdparty/Pi3
+	url = git@github.com:Marwan99/Pi3_w_KV.git
+[submodule "thirdparty/segment-anything-2-real-time"]
+	path = thirdparty/segment-anything-2-real-time
+	url = git@github.com:Gy920/segment-anything-2-real-time.git

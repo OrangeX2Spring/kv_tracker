@@ -1,0 +1,7 @@
+datasource: onePoseLoader
+que_size: -1 # No limit
+
+offset: 0
+
+results_path: media/0724-vitamin-others
+scene_dir: datasets/OnePose/lowtexture_test_data/0724-vitamin-others/vitamin-2

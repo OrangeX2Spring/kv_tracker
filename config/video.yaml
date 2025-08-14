@@ -1,0 +1,5 @@
+datasource: phoneLoader
+que_size: 1 # No limit
+
+results_path: media/temp
+scene_dir: path/to/video.mp4

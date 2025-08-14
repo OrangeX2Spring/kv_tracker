@@ -1,0 +1,11 @@
+datasource: arcticLoader
+que_size: -1 # No limit
+
+offset: 2
+
+# results_path: debug_dumps
+use_bbox: -1
+export_masked_imgs: False
+
+results_path: media/espressomachine_grab_01
+scene_dir: datasets/arctic/data/arctic_data/data/cropped_images_grab_only_subset/s01/espressomachine_grab_01

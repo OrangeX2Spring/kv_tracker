@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools==70.0.0", "torch"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kv-tracker"
+version = "0.0.1"
+dependencies = [
+    "torch",
+    "torchvision",
+    "numpy",
+    "tqdm",
+    "rerun-sdk",
+    "opencv-python",
+    "pyrealsense2",
+    "PyYAML",
+    "Pi3",
+    "imageio",
+    "scipy",
+    "matplotlib",
+    "huggingface_hub", # pi3 req
+    "open3d", # Visualization req
+    "safetensors", # pi3 req
+    "open3d",
+    "hydra-core",
+    "evo",
+    "sam-2", # object level req
+]
+
+[tool.uv.sources]
+Pi3 = { path = "thirdparty/Pi3", editable = true }
+sam-2 = { path = "thirdparty/segment-anything-2-real-time", editable = true }
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["kv_tracker"]
+namespaces = false

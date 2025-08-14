@@ -1,0 +1,10 @@
+datasource: SintelLoader
+que_size: -1 # No limit
+
+offset: 0
+
+results_path: debug_dumps
+use_bbox: -1
+export_masked_imgs: False
+
+scene_dir: datasets/sintel/training/final/alley_1

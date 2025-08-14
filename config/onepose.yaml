@@ -1,0 +1,7 @@
+datasource: onePoseLoader
+que_size: -1 # No limit
+
+offset: 0
+
+results_path: media/0548-duck-others
+scene_dir: datasets/OnePose/test_data/0548-duck-others/duck-4

@@ -1,0 +1,11 @@
+datasource: TUMLoader
+que_size: -1 # No limit
+
+offset: 0
+
+results_path: debug_dumps
+use_bbox: -1
+export_masked_imgs: False
+
+results_path: media/tum_teddy
+scene_dir: datasets/tum_rgbd/rgbd_dataset_freiburg1_teddy
