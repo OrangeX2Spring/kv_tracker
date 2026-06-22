@@ -1,5 +1,7 @@
 # [CVPR 2026] KV-Tracker: Real-Time Pose Tracking with Transformers
 
+### 🏆 Best Demo Award
+
 ### [Project Page](https://marwan99.github.io/kv_tracker/) | [arXiv](https://arxiv.org/abs/2512.22581)
 
 **Marwan Taher, Ignacio Alzugaray, Kirill Mazur, Xin Kong, Andrew J. Davison**
