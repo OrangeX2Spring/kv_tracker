@@ -192,7 +192,8 @@ def follower_cam(cur_T_wc, offset=np.array([0.0, 0.0, 0.5])):
     )
 
 
-def run_track3r(cfg = None, args = None):
+def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=None,
+               keyframe_indices=None):
 
     device = "cuda:0"
     tracking_frame_type = "resized_rgb_masked" # "rgb_crop", "resized_rgb_masked"
@@ -247,13 +248,17 @@ def run_track3r(cfg = None, args = None):
     # ----------------------
     # Start Data Stream Process
     # ----------------------
-    frames_que = mp.Queue(maxsize=cfg["que_size"])
-    data_proc = mp.Process(
-        target=data_stream_proc,
-        args=(frames_que, device),
-        kwargs={"resize_dim": resize_dim, **cfg}
-    )
-    data_proc.start()
+    if frame_source is None:
+        frames_que = mp.Queue(maxsize=cfg["que_size"])
+        data_proc = mp.Process(
+            target=data_stream_proc,
+            args=(frames_que, device),
+            kwargs={"resize_dim": resize_dim, **cfg}
+        )
+        data_proc.start()
+    else:
+        assert not args.manual_kf
+        frame_source = iter(frame_source)
 
     model = load_pi3_from_pretrained(device).eval()
     model = move_pi3_mlps_to_bfloat32(model)
@@ -266,9 +271,12 @@ def run_track3r(cfg = None, args = None):
     else:
         keyframes = []
         while len(keyframes) < 1:
-            if frames_que.empty():
-                continue
-            frame_data = frames_que.get()
+            if frame_source is None:
+                if frames_que.empty():
+                    continue
+                frame_data = frames_que.get()
+            else:
+                frame_data = next(frame_source)
 
             keyframes.append(frame_data)
             keyframes.append(frame_data)
@@ -288,6 +296,7 @@ def run_track3r(cfg = None, args = None):
 
     kf_rgb_np = np.stack(kf_rgb_np_list, axis=0)  # [N_keyframes, H, W, 3]
     kf_masks_np = np.stack(kf_masks, axis=0)  # [N_keyframes, H, W]
+    capture_frame_ids = [kf["idx"] for kf in keyframes]
 
     print(f"Frames shapes: {kf_rgb_np_list[0].shape}")
 
@@ -308,12 +317,18 @@ def run_track3r(cfg = None, args = None):
 
     # offset the scene to be centered around the object
 
+    initial_point_conf = batch_conf.clone() if snapshot_callback is not None else None
     batch_conf = batch_conf.squeeze()
     batch_conf[~kf_masks] = 0.0
     batch_conf = batch_conf.sum(dim=(-2, -1)) / kf_masks.sum(dim=(-2, -1))
 
     kf_conf_thresh = batch_conf[0] * 0.6
     pts3d_conf_thresh = kf_conf_thresh * 1.15
+    if snapshot_callback is not None:
+        snapshot_callback("keyframes", capture_frame_ids, batch_pts3d,
+                          batch_pred_T_wc, initial_point_conf, kf_rgb_np,
+                          kf_masks_np, pts3d_conf_thresh, keyframes[-1]["rgb_np"])
+        del initial_point_conf
 
     if args.rerun:
         visualise_pi3(
@@ -351,14 +366,19 @@ def run_track3r(cfg = None, args = None):
     kf_poses = [batch_pred_T_wc[0, 0].cpu().numpy()]
     assert len(poses_np_list) == len(good_idx)
 
-    prev_pred = batch_pred_T_wc.squeeze()
-    while data_proc.is_alive():
+    prev_pred = torch.linalg.inv(origin_offset).clone()
+    while frame_source is not None or data_proc.is_alive():
         start_time = perf_counter()
 
         # Get next frame if available
-        if frames_que.empty():
-            continue
-        current_frame = frames_que.get_nowait()
+        if frame_source is None:
+            if frames_que.empty():
+                continue
+            current_frame = frames_que.get_nowait()
+        else:
+            current_frame = next(frame_source, None)
+            if current_frame is None:
+                break
 
 
         segmentation_time = perf_counter()
@@ -417,6 +437,12 @@ def run_track3r(cfg = None, args = None):
             pred_pts3d = pred_pts3d.to(torch.float32)
 
         T_w2c = pred_T_wc.squeeze().cpu().numpy()
+        if snapshot_callback is not None and not args.cam_only:
+            snapshot_callback("queries", [current_frame["idx"]], pred_pts3d,
+                              pred_T_wc, pred_conf,
+                              current_frame["resized_rgb_masked_np"][None],
+                              current_frame["resized_mask_np"][None],
+                              pts3d_conf_thresh, current_frame["rgb_np"])
 
         # Export pose estimates
         poses_np_list.append(T_w2c)
@@ -451,15 +477,20 @@ def run_track3r(cfg = None, args = None):
             should_add_kf = (int(args.kf_auto) > 0 and (idx % int(args.kf_auto) == 0))
             should_add_kf = should_add_kf and (kf_rgb_np.shape[0] < 20)
 
+        if keyframe_indices is not None:
+            should_add_kf = current_frame["idx"] in keyframe_indices
+
         if should_add_kf:
 
             if not kf_init and kf_rgb_np.shape[0] == 2:
                 kf_init = True
                 kf_rgb_np = kf_rgb_np[0][None]
                 kf_masks_np = kf_masks_np[0][None]
+                capture_frame_ids = capture_frame_ids[:1]
 
             kf_rgb_np = np.concatenate([kf_rgb_np, current_frame[mapping_frame_type][None]], axis=0)  # [N_keyframes, H, W]
             kf_masks_np = np.concatenate([kf_masks_np, current_frame[mapping_frame_mask_type][None]], axis=0)  # [N_keyframes, H, W]
+            capture_frame_ids.append(current_frame["idx"])
 
             batch_pts3d , batch_pred_T_wc, batch_conf, batch_images_np, local_pts3d, origin_offset = pi3_inference(
                 model, [kf_rgb_np], device, cam_only=False, store_cache=True
@@ -588,6 +619,11 @@ def run_track3r(cfg = None, args = None):
                     pixels_to_viz,
                     color=[255, 0, 0],
                 )
+
+            if snapshot_callback is not None:
+                snapshot_callback("keyframes", capture_frame_ids, batch_pts3d,
+                                  batch_pred_T_wc, batch_conf, kf_rgb_np,
+                                  kf_masks_np, pts3d_conf_thresh, current_frame["rgb_np"])
 
             batch_conf = batch_conf.squeeze()
             batch_conf[~kf_masks] = 0.0
