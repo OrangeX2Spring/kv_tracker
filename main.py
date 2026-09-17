@@ -193,7 +193,9 @@ def follower_cam(cur_T_wc, offset=np.array([0.0, 0.0, 0.5])):
 
 
 def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=None,
-               keyframe_indices=None):
+               keyframe_indices=None, keyframe_selector=None):
+
+    assert keyframe_indices is None or keyframe_selector is None
 
     device = "cuda:0"
     tracking_frame_type = "resized_rgb_masked" # "rgb_crop", "resized_rgb_masked"
@@ -262,6 +264,8 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
 
     model = load_pi3_from_pretrained(device).eval()
     model = move_pi3_mlps_to_bfloat32(model)
+    if keyframe_selector is not None:
+        keyframe_selector.attach(model)
 
     # Get Keyframes
     # =============
@@ -307,6 +311,8 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
     batch_pts3d, batch_pred_T_wc, batch_conf, batch_images_np, local_pts3d, origin_offset = pi3_inference(
         model, [kf_rgb_np], device, cam_only=False, store_cache=True, tokens_mask=None
     )
+    if keyframe_selector is not None:
+        keyframe_selector.bootstrap(keyframes[0])
 
     kf_masks = torch.tensor(kf_masks_np, device=device).bool()
     obj_center = batch_pts3d[0][kf_masks].mean(dim=0)
@@ -314,6 +320,9 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
     scene_origin = obj_center.clone()
     batch_pts3d[..., :] -= scene_origin
     batch_pred_T_wc[..., :3, 3] -= scene_origin
+
+    if keyframe_selector is not None:
+        selector_obj_center = batch_pts3d[0][kf_masks].mean(dim=0)
 
     # offset the scene to be centered around the object
 
@@ -479,6 +488,10 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
 
         if keyframe_indices is not None:
             should_add_kf = current_frame["idx"] in keyframe_indices
+        if keyframe_selector is not None:
+            should_add_kf = keyframe_selector.select(
+                current_frame, selector_obj_center, pred_T_wc[0, 0],
+                batch_pred_T_wc[0], capture_frame_ids, bool(should_add_kf))
 
         if should_add_kf:
 
@@ -620,6 +633,8 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
                     color=[255, 0, 0],
                 )
 
+            if keyframe_selector is not None:
+                selector_obj_center = batch_pts3d[0][kf_masks].mean(dim=0)
             if snapshot_callback is not None:
                 snapshot_callback("keyframes", capture_frame_ids, batch_pts3d,
                                   batch_pred_T_wc, batch_conf, kf_rgb_np,
