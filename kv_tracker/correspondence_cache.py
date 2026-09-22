@@ -186,7 +186,8 @@ class CorrespondenceCache(CombinedCache):
                 assert tensor.ndim == 4 and tensor.shape[2] == len(frame_ids) * token_count
                 if len(indices) != tensor.shape[2]:
                     layer[name] = tensor.index_select(2, indices.to(tensor.device))
-        self.events.append(dict(frame=frame_ids[-1], retained_frame_ids=list(frame_ids),
+        self.events.append(dict(frame=frame_ids[-1],
+            retained_frame_ids=list(self.records),
             evicted=list(self.evicted),
             patch_indices={str(i): r['indices'].tolist() for i, r in self.records.items()},
             object_patches=int(labels.sum()), object_patches_kept=int(labels[picked].sum()),
