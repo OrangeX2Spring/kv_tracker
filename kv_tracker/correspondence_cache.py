@@ -99,20 +99,26 @@ rounding preserves the total count; there is no extra semantic token allowance.
 class CorrespondenceCache(CombinedCache):
     supports_object_mode = True
 
-    def __init__(self, policy, budget=32, interval=30):
+    def __init__(self, policy, budget=8, interval=30, phase=0):
         assert policy in ('dense', 'uniform', 'correspondence', 'semantic_correspondence')
+        assert phase in (0, 1)
         super().__init__(budget, interval, 1. if policy == 'dense' else 0.5)
         self.policy = policy
+        self.phase = phase
+        self.evicted = []
 
     def begin_query(self, frame_id):
-        self.capture_enabled = frame_id % self.interval == 0 and len(self.records) < self.budget
+        self.capture_enabled = (frame_id + self.phase) % self.interval == 0
 
     def select(self, frame_id, cached_ids):
         assert sorted(set(cached_ids)) == list(self.records)
         assert max(cached_ids) < frame_id
-        if frame_id % self.interval or len(self.records) >= self.budget:
+        if (frame_id + self.phase) % self.interval:
             return False
         self.keep_frame_ids = list(self.records)
+        self.evicted = []
+        if len(self.keep_frame_ids) == self.budget:
+            self.evicted = [self.keep_frame_ids.pop(1)]
         self.pending = frame_id
         self.capture_enabled = False
         return True
@@ -139,6 +145,7 @@ class CorrespondenceCache(CombinedCache):
             picked = torch.arange(total)
         else:
             assert frame_ids == self.keep_frame_ids + [self.pending]
+            self.records = {i: self.records[i] for i in self.keep_frame_ids}
             if self.policy in ('correspondence', 'semantic_correspondence'):
                 # Rebuild updates every pointmap together; never mix gauges from
                 # separately predicted frames. Old patch choices remain fixed.
@@ -180,7 +187,8 @@ class CorrespondenceCache(CombinedCache):
                 if len(indices) != tensor.shape[2]:
                     layer[name] = tensor.index_select(2, indices.to(tensor.device))
         self.events.append(dict(frame=frame_ids[-1], retained_frame_ids=list(frame_ids),
-            evicted=[], patch_indices={str(i): r['indices'].tolist() for i, r in self.records.items()},
+            evicted=list(self.evicted),
+            patch_indices={str(i): r['indices'].tolist() for i, r in self.records.items()},
             object_patches=int(labels.sum()), object_patches_kept=int(labels[picked].sum()),
             matched_patches=int((links >= 0).sum()), matched_kept=int((links[picked] >= 0).sum()),
             object_matched_kept=int(((links[picked] >= 0) & labels[picked]).sum()),
