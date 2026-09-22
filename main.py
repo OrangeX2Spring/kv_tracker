@@ -193,7 +193,7 @@ def follower_cam(cur_T_wc, offset=np.array([0.0, 0.0, 0.5])):
 
 
 def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=None,
-               keyframe_indices=None, keyframe_selector=None):
+               keyframe_indices=None, keyframe_selector=None, keyframe_cache=None):
 
     assert keyframe_indices is None or keyframe_selector is None
 
@@ -215,6 +215,12 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
     parser.add_argument('--kf_auto', default=50)
     parser.add_argument('--sim3', default=False, action='store_true')
     args = parser.parse_args(args)
+
+    if keyframe_cache is not None:
+        # The evaluated scene protocol uses first-frame gauge, not optional Sim(3).
+        assert keyframe_selector is not None and frame_source is not None
+        assert args.cam_only and not args.obj_mode and not args.sim3
+        assert not args.manual_kf and not args.crop_kf
 
     if cfg is None:
         cfg = yaml.safe_load(open(args.config, 'r'))
@@ -266,6 +272,8 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
     model = move_pi3_mlps_to_bfloat32(model)
     if keyframe_selector is not None:
         keyframe_selector.attach(model)
+    if keyframe_cache is not None:
+        keyframe_cache.attach(model)
 
     # Get Keyframes
     # =============
@@ -311,6 +319,8 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
     batch_pts3d, batch_pred_T_wc, batch_conf, batch_images_np, local_pts3d, origin_offset = pi3_inference(
         model, [kf_rgb_np], device, cam_only=False, store_cache=True, tokens_mask=None
     )
+    if keyframe_cache is not None:
+        keyframe_cache.after_rebuild(capture_frame_ids, batch_conf)
     if keyframe_selector is not None:
         keyframe_selector.bootstrap(keyframes[0])
 
@@ -401,6 +411,8 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
         # ----------------------
         # Latest Frame Inference
         # ----------------------
+        if keyframe_cache is not None:
+            keyframe_cache.begin_query(current_frame['idx'])
         inference_ret = pi3_inference(
             model,
             current_frame[tracking_frame_type].clone(),
@@ -501,6 +513,13 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
                 kf_masks_np = kf_masks_np[0][None]
                 capture_frame_ids = capture_frame_ids[:1]
 
+            if keyframe_cache is not None:
+                keep = [i for i, frame_id in enumerate(capture_frame_ids)
+                        if frame_id in keyframe_cache.keep_frame_ids]
+                kf_rgb_np = kf_rgb_np[keep]
+                kf_masks_np = kf_masks_np[keep]
+                capture_frame_ids = [capture_frame_ids[i] for i in keep]
+
             kf_rgb_np = np.concatenate([kf_rgb_np, current_frame[mapping_frame_type][None]], axis=0)  # [N_keyframes, H, W]
             kf_masks_np = np.concatenate([kf_masks_np, current_frame[mapping_frame_mask_type][None]], axis=0)  # [N_keyframes, H, W]
             capture_frame_ids.append(current_frame["idx"])
@@ -508,6 +527,8 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
             batch_pts3d , batch_pred_T_wc, batch_conf, batch_images_np, local_pts3d, origin_offset = pi3_inference(
                 model, [kf_rgb_np], device, cam_only=False, store_cache=True
             )
+            if keyframe_cache is not None:
+                keyframe_cache.after_rebuild(capture_frame_ids, batch_conf)
 
             kf_masks = torch.tensor(kf_masks_np, device=device).bool()
             obj_center = batch_pts3d[0][kf_masks].mean(dim=0)
@@ -750,7 +771,9 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
                     np.save(f, np.array(kf_poses))
                 
                 with open(results_path / "kf_idx.npy", 'wb') as f:
-                    np.save(f, np.array(kf_idx))
+                    np.save(f, np.array(capture_frame_ids if keyframe_cache is not None else kf_idx))
+                if keyframe_cache is not None:
+                    np.save(results_path / 'inserted_kf_idx.npy', np.array(kf_idx))
                 
                 if args.export_pcd:
                     pcd_path = results_path / f"pcd_{idx}.ply"
