@@ -219,7 +219,8 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
     if keyframe_cache is not None:
         # The evaluated scene protocol uses first-frame gauge, not optional Sim(3).
         assert keyframe_selector is not None and frame_source is not None
-        assert args.cam_only and not args.obj_mode and not args.sim3
+        assert not args.sim3 and (args.cam_only or args.obj_mode)
+        assert not args.obj_mode or keyframe_cache.supports_object_mode
         assert not args.manual_kf and not args.crop_kf
 
     if cfg is None:
@@ -320,7 +321,8 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
         model, [kf_rgb_np], device, cam_only=False, store_cache=True, tokens_mask=None
     )
     if keyframe_cache is not None:
-        keyframe_cache.after_rebuild(capture_frame_ids, batch_conf)
+        keyframe_cache.after_rebuild(capture_frame_ids, batch_conf,
+                                     points=batch_pts3d, masks=kf_masks_np)
     if keyframe_selector is not None:
         keyframe_selector.bootstrap(keyframes[0])
 
@@ -528,7 +530,8 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
                 model, [kf_rgb_np], device, cam_only=False, store_cache=True
             )
             if keyframe_cache is not None:
-                keyframe_cache.after_rebuild(capture_frame_ids, batch_conf)
+                keyframe_cache.after_rebuild(capture_frame_ids, batch_conf,
+                                             points=batch_pts3d, masks=kf_masks_np)
 
             kf_masks = torch.tensor(kf_masks_np, device=device).bool()
             obj_center = batch_pts3d[0][kf_masks].mean(dim=0)

@@ -11,6 +11,8 @@ import torch.nn.functional as F
 
 
 class CombinedCache:
+    supports_object_mode = False
+
     def __init__(self, budget=20, interval=50, patch_fraction=0.5):
         assert budget >= 2 and interval >= 2 and 0 < patch_fraction <= 1
         self.budget = budget
@@ -70,7 +72,7 @@ class CombinedCache:
         self.capture_enabled = False
         return True
 
-    def after_rebuild(self, frame_ids, confidence):
+    def after_rebuild(self, frame_ids, confidence, *, points=None, masks=None):
         assert confidence.ndim == 5 and confidence.shape[:2] == (1, len(frame_ids))
         assert confidence.shape[-1] == 1 and frame_ids[0] == 0
         h, w = confidence.shape[2:4]
