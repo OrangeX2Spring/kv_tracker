@@ -22,6 +22,7 @@ from kv_tracker.dataloaders.tum import TUMLoader
 from kv_tracker.dataloaders.phone import phoneLoader
 from kv_tracker.dataloaders.sintel import SintelLoader
 from kv_tracker.dataloaders.arctic_loader import arcticLoader
+from kv_tracker.token_drop import patch_keep
 from kv_tracker.pi3_utilts import (
     load_pi3_from_pretrained,
     pi3_inference,
@@ -214,7 +215,14 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
     parser.add_argument('--resize_dim', default=518) # 308, 518, 630
     parser.add_argument('--kf_auto', default=50)
     parser.add_argument('--sim3', default=False, action='store_true')
+    # Object mode only: skip patches outside the SAM mask instead of computing zeros.
+    parser.add_argument('--token_drop', default=False, action='store_true')
     args = parser.parse_args(args)
+    assert not args.token_drop or (args.obj_mode and not args.crop_kf and keyframe_cache is None)
+
+    def keep_for(masks):
+        # (N, H, W) masks at Pi3 input size; None computes every patch, as upstream.
+        return patch_keep(torch.as_tensor(masks, device=device).bool()) if args.token_drop else None
 
     if keyframe_cache is not None:
         # The evaluated scene protocol uses first-frame gauge, not optional Sim(3).
@@ -318,7 +326,8 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
         rr.log("keyframes/images", rr.Image(kf_rgb_viz_np))
 
     batch_pts3d, batch_pred_T_wc, batch_conf, batch_images_np, local_pts3d, origin_offset = pi3_inference(
-        model, [kf_rgb_np], device, cam_only=False, store_cache=True, tokens_mask=None
+        model, [kf_rgb_np], device, cam_only=False, store_cache=True, tokens_mask=None,
+        keep=keep_for(kf_masks_np)
     )
     if keyframe_cache is not None:
         keyframe_cache.after_rebuild(capture_frame_ids, batch_conf,
@@ -422,6 +431,7 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
             cam_only=args.cam_only,
             store_cache=False,
             use_cache=True,
+            keep=keep_for(current_frame["resized_mask"][None]),
         ) 
 
         if args.cam_only:
@@ -527,7 +537,8 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
             capture_frame_ids.append(current_frame["idx"])
 
             batch_pts3d , batch_pred_T_wc, batch_conf, batch_images_np, local_pts3d, origin_offset = pi3_inference(
-                model, [kf_rgb_np], device, cam_only=False, store_cache=True
+                model, [kf_rgb_np], device, cam_only=False, store_cache=True,
+                keep=keep_for(kf_masks_np)
             )
             if keyframe_cache is not None:
                 keyframe_cache.after_rebuild(capture_frame_ids, batch_conf,
@@ -697,7 +708,8 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
                 # Reset kv cache
                 # model.kv_cache = last_kv
                 batch_pts3d , batch_pred_T_wc, batch_conf, batch_images_np, local_pts3d, origin_offset = pi3_inference(
-                    model, [kf_rgb_np], device, cam_only=False, store_cache=True
+                    model, [kf_rgb_np], device, cam_only=False, store_cache=True,
+                    keep=keep_for(kf_masks_np)
                 )
 
                 kf_masks = torch.tensor(kf_masks_np, device=device).bool()
