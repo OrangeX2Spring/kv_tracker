@@ -11,11 +11,17 @@ import torch
 
 
 class AppendOnlyCache:
-    def __init__(self, insertion_indices, verify=False, refresh_frame=None):
+    def __init__(self, insertion_indices, verify=False, refresh_frame=None,
+                 refresh_gauge='frozen'):
         assert insertion_indices == sorted(set(insertion_indices))
         assert all(type(i) is int and i > 0 for i in insertion_indices)
         assert refresh_frame is None or refresh_frame in insertion_indices
+        # 'keyframe0' re-anchors output normalization on the refreshed frame-0
+        # prediction, as every native rebuild does; 'frozen' keeps bootstrap's.
+        assert refresh_gauge in ('frozen', 'keyframe0')
+        assert refresh_gauge == 'frozen' or refresh_frame is not None
         self.refresh_frame = refresh_frame
+        self.refresh_gauge = refresh_gauge
         self.refresh_events = []
         self.indices = set(insertion_indices)
         self.verify = verify

@@ -566,12 +566,17 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
                     old_cache = {i: dict(layer) for i, layer in model.cache.items()}
                     torch.cuda.synchronize()
                     refresh_started = perf_counter()
-                    # Discard predicted poses: only replace K/V. Keep bootstrap
-                    # origin_offset, scene_origin and recorded poses unchanged.
-                    pi3_inference(model, [kf_rgb_np], device, cam_only=True,
-                                  store_cache=True, keep=keep_for(kf_masks_np))
+                    # Replace K/V. scene_origin and recorded poses stay unchanged;
+                    # origin_offset too unless re-anchored as a native rebuild does.
+                    refresh_T_wc = pi3_inference(model, [kf_rgb_np], device, cam_only=True,
+                                                 store_cache=True, keep=keep_for(kf_masks_np))
                     torch.cuda.synchronize()
                     refresh_seconds = perf_counter() - refresh_started
+                    assert refresh_T_wc.shape == (1, len(capture_frame_ids), 4, 4)
+                    bootstrap_origin_offset = origin_offset.cpu().tolist()
+                    if keyframe_append.refresh_gauge == 'keyframe0':
+                        with torch.amp.autocast("cuda", dtype=torch.float64):
+                            origin_offset = torch.linalg.inv(refresh_T_wc[0, 0])
                     assert set(old_cache) == set(model.cache)
                     changed_layers = []
                     for layer, old in old_cache.items():
@@ -587,7 +592,9 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
                     keyframe_append.refresh_events.append(dict(
                         frame=current_frame['idx'], cache_frame_ids=list(capture_frame_ids),
                         seconds=refresh_seconds, changed_layers=changed_layers,
-                        cache_shapes_preserved=True,
+                        cache_shapes_preserved=True, gauge=keyframe_append.refresh_gauge,
+                        raw_keyframe_poses=refresh_T_wc[0].float().cpu().tolist(),
+                        bootstrap_origin_offset=bootstrap_origin_offset,
                         origin_offset=origin_offset.cpu().tolist(),
                         scene_origin=scene_origin.cpu().tolist()))
                     del old_cache, old, new
