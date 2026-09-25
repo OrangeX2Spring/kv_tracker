@@ -553,6 +553,45 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
                 origin_offset=origin_offset.cpu().tolist(), scene_origin=scene_origin.cpu().tolist(),
                 sim3_enabled=False, unique_keyframe_ids=list(kf_idx))
 
+            if keyframe_append.refresh_frame is not None:
+                # Retain the same physical history, including both frame-0 slots.
+                kf_rgb_np = np.concatenate(
+                    [kf_rgb_np, current_frame[mapping_frame_type][None]], axis=0)
+                kf_masks_np = np.concatenate(
+                    [kf_masks_np, current_frame[mapping_frame_mask_type][None]], axis=0)
+                if current_frame['idx'] == keyframe_append.refresh_frame:
+                    assert not keyframe_append.refresh_events
+                    assert len(kf_rgb_np) == len(capture_frame_ids)
+                    assert not keyframe_append.capture and not keyframe_append.pending
+                    old_cache = {i: dict(layer) for i, layer in model.cache.items()}
+                    torch.cuda.synchronize()
+                    refresh_started = perf_counter()
+                    # Discard predicted poses: only replace K/V. Keep bootstrap
+                    # origin_offset, scene_origin and recorded poses unchanged.
+                    pi3_inference(model, [kf_rgb_np], device, cam_only=True,
+                                  store_cache=True, keep=keep_for(kf_masks_np))
+                    torch.cuda.synchronize()
+                    refresh_seconds = perf_counter() - refresh_started
+                    assert set(old_cache) == set(model.cache)
+                    changed_layers = []
+                    for layer, old in old_cache.items():
+                        changed = False
+                        for name in ('k', 'v'):
+                            new = model.cache[layer][name]
+                            assert new.shape == old[name].shape
+                            assert new.dtype == old[name].dtype
+                            changed |= not torch.equal(new, old[name])
+                        if changed:
+                            changed_layers.append(layer)
+                    assert changed_layers
+                    keyframe_append.refresh_events.append(dict(
+                        frame=current_frame['idx'], cache_frame_ids=list(capture_frame_ids),
+                        seconds=refresh_seconds, changed_layers=changed_layers,
+                        cache_shapes_preserved=True,
+                        origin_offset=origin_offset.cpu().tolist(),
+                        scene_origin=scene_origin.cpu().tolist()))
+                    del old_cache, old, new
+
         elif should_add_kf:
 
             if not kf_init and kf_rgb_np.shape[0] == 2:
