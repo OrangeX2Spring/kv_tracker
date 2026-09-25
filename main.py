@@ -194,7 +194,8 @@ def follower_cam(cur_T_wc, offset=np.array([0.0, 0.0, 0.5])):
 
 
 def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=None,
-               keyframe_indices=None, keyframe_selector=None, keyframe_cache=None):
+               keyframe_indices=None, keyframe_selector=None, keyframe_cache=None,
+               keyframe_append=None):
 
     assert keyframe_indices is None or keyframe_selector is None
 
@@ -219,6 +220,14 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
     parser.add_argument('--token_drop', default=False, action='store_true')
     args = parser.parse_args(args)
     assert not args.token_drop or (args.obj_mode and not args.crop_kf and keyframe_cache is None)
+    if keyframe_append is not None:
+        # A1 is deliberately limited to fixed-ID scene/camera tracking.
+        assert args.cam_only and not args.obj_mode and not args.sim3
+        assert not any((args.manual_kf, args.crop_kf, args.token_drop, args.rerun,
+                        args.mesh, args.export_pcd))
+        assert keyframe_cache is None and snapshot_callback is None
+        assert frame_source is not None and keyframe_selector is not None
+        assert keyframe_selector.fixed_indices == keyframe_append.indices
 
     def keep_for(masks):
         # (N, H, W) masks at Pi3 input size; None computes every patch, as upstream.
@@ -283,6 +292,8 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
         keyframe_selector.attach(model)
     if keyframe_cache is not None:
         keyframe_cache.attach(model)
+    if keyframe_append is not None:
+        keyframe_append.attach(model)
 
     # Get Keyframes
     # =============
@@ -424,6 +435,8 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
         # ----------------------
         if keyframe_cache is not None:
             keyframe_cache.begin_query(current_frame['idx'])
+        if keyframe_append is not None:
+            keyframe_append.begin_query(current_frame['idx'])
         inference_ret = pi3_inference(
             model,
             current_frame[tracking_frame_type].clone(),
@@ -517,7 +530,30 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
                 current_frame, selector_obj_center, pred_T_wc[0, 0],
                 batch_pred_T_wc[0], capture_frame_ids, bool(should_add_kf))
 
-        if should_add_kf:
+        if keyframe_append is not None:
+            assert bool(should_add_kf) == (current_frame['idx'] in keyframe_append.indices)
+
+        if should_add_kf and keyframe_append is not None:
+            keyframe_append.commit(current_frame['idx'])
+            # pred_T_wc already uses the original bootstrap gauge. Neither the
+            # old poses nor origin_offset/scene_origin are recomputed here.
+            previous_poses = batch_pred_T_wc
+            batch_pred_T_wc = torch.cat((previous_poses, pred_T_wc), dim=1)
+            if keyframe_append.verify:
+                assert torch.equal(batch_pred_T_wc[:, :-1], previous_poses)
+            capture_frame_ids.append(current_frame['idx'])
+            assert capture_frame_ids == keyframe_append.frame_ids
+            kf_idx.append(current_frame['idx'])
+            # Cache has two bootstrap slots, but saved keyframe IDs/poses are unique.
+            unique_poses = torch.cat((batch_pred_T_wc[:, :1], batch_pred_T_wc[:, 2:]), dim=1)
+            np.save(results_path / 'kf_idx.npy', np.array(kf_idx))
+            np.save(results_path / 'kf_poses.npy', unique_poses[0].cpu().numpy())
+            keyframe_append.events[-1].update(
+                old_pose_prefix_verified=keyframe_append.verify,
+                origin_offset=origin_offset.cpu().tolist(), scene_origin=scene_origin.cpu().tolist(),
+                sim3_enabled=False, unique_keyframe_ids=list(kf_idx))
+
+        elif should_add_kf:
 
             if not kf_init and kf_rgb_np.shape[0] == 2:
                 kf_init = True
