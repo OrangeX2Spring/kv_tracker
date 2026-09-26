@@ -26,8 +26,9 @@ def move_pi3_mlps_to_bfloat32(model):
 
     return model
 
-def pi3_inference(model, images_np_list, device, cam_only=False, store_cache=False, use_cache=False, tokens_mask=None, keep=None, **pi_kwargs):
-    """``keep`` (N, h*w) bool runs only those patches; see kv_tracker.token_drop."""
+def pi3_inference(model, images_np_list, device, cam_only=False, store_cache=False, use_cache=False, tokens_mask=None, keep=None, background=None, **pi_kwargs):
+    """``keep`` (N, h*w) bool runs only those patches; ``background`` marks kept
+    patches outside the object. See kv_tracker.token_drop."""
 
     if type(images_np_list) is list or type(images_np_list) is np.ndarray:
         images_np = np.array(images_np_list)
@@ -46,7 +47,8 @@ def pi3_inference(model, images_np_list, device, cam_only=False, store_cache=Fal
             else:
                 assert tokens_mask is None and not pi_kwargs
                 results = forward_kept(model, images_tensor, keep, cam_only=cam_only,
-                                       store_cache=store_cache, use_cache=use_cache)
+                                       store_cache=store_cache, use_cache=use_cache,
+                                       background=background)
 
     T_wc = results["camera_poses"]#.reshape(B, N, 4, 4)
 

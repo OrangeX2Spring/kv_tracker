@@ -22,7 +22,8 @@ from kv_tracker.dataloaders.tum import TUMLoader
 from kv_tracker.dataloaders.phone import phoneLoader
 from kv_tracker.dataloaders.sintel import SintelLoader
 from kv_tracker.dataloaders.arctic_loader import arcticLoader
-from kv_tracker.token_drop import patch_keep
+from kv_tracker import token_drop
+from kv_tracker.token_drop import background_keep, patch_keep
 from kv_tracker.pi3_utilts import (
     load_pi3_from_pretrained,
     pi3_inference,
@@ -218,8 +219,18 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
     parser.add_argument('--sim3', default=False, action='store_true')
     # Object mode only: skip patches outside the SAM mask instead of computing zeros.
     parser.add_argument('--token_drop', default=False, action='store_true')
+    # A2, with --token_drop: keep K background patches per frame (-1: all), give
+    # them the log-mass attention bias, and/or record global-layer attention mass.
+    parser.add_argument('--keep_background', type=int, default=0)
+    parser.add_argument('--background_mass', default=False, action='store_true')
+    parser.add_argument('--attention_probe', default=False, action='store_true')
     args = parser.parse_args(args)
     assert not args.token_drop or (args.obj_mode and not args.crop_kf and keyframe_cache is None)
+    assert args.token_drop or not (args.keep_background or args.background_mass
+                                   or args.attention_probe)
+    assert args.keep_background >= -1
+    assert not args.background_mass or args.keep_background > 0
+    token_drop.config.update(mass=args.background_mass, probe=None)
     if keyframe_append is not None:
         # A1 is deliberately limited to fixed-ID scene/camera tracking.
         assert args.cam_only and not args.obj_mode and not args.sim3
@@ -230,8 +241,15 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
         assert keyframe_selector.fixed_indices == keyframe_append.indices
 
     def keep_for(masks):
-        # (N, H, W) masks at Pi3 input size; None computes every patch, as upstream.
-        return patch_keep(torch.as_tensor(masks, device=device).bool()) if args.token_drop else None
+        # (N, H, W) masks at Pi3 input size; no keep computes every patch, as upstream.
+        if not args.token_drop:
+            return {}
+        keep = patch_keep(torch.as_tensor(masks, device=device).bool())
+        if args.keep_background == 0:
+            return dict(keep=keep)
+        keep, background = background_keep(
+            keep, None if args.keep_background == -1 else args.keep_background)
+        return dict(keep=keep, background=background)
 
     if keyframe_cache is not None:
         # The evaluated scene protocol uses first-frame gauge, not optional Sim(3).
@@ -267,6 +285,8 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
     else:
         results_path = Path("debug_dumps")
     os.makedirs(results_path, exist_ok=True)
+    if args.attention_probe:
+        token_drop.config['probe'] = token_drop.Probe(results_path / 'attention_probe.jsonl')
 
     print(f"Using resize dim: {resize_dim}")
     print(f"Saving results to {results_path}")
@@ -338,7 +358,7 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
 
     batch_pts3d, batch_pred_T_wc, batch_conf, batch_images_np, local_pts3d, origin_offset = pi3_inference(
         model, [kf_rgb_np], device, cam_only=False, store_cache=True, tokens_mask=None,
-        keep=keep_for(kf_masks_np)
+        **keep_for(kf_masks_np)
     )
     if keyframe_cache is not None:
         keyframe_cache.after_rebuild(capture_frame_ids, batch_conf,
@@ -444,7 +464,7 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
             cam_only=args.cam_only,
             store_cache=False,
             use_cache=True,
-            keep=keep_for(current_frame["resized_mask"][None]),
+            **keep_for(current_frame["resized_mask"][None]),
         ) 
 
         if args.cam_only:
@@ -569,7 +589,7 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
                     # Replace K/V. scene_origin and recorded poses stay unchanged;
                     # origin_offset too unless re-anchored as a native rebuild does.
                     refresh_T_wc = pi3_inference(model, [kf_rgb_np], device, cam_only=True,
-                                                 store_cache=True, keep=keep_for(kf_masks_np))
+                                                 store_cache=True, **keep_for(kf_masks_np))
                     torch.cuda.synchronize()
                     refresh_seconds = perf_counter() - refresh_started
                     assert refresh_T_wc.shape == (1, len(capture_frame_ids), 4, 4)
@@ -620,7 +640,7 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
 
             batch_pts3d , batch_pred_T_wc, batch_conf, batch_images_np, local_pts3d, origin_offset = pi3_inference(
                 model, [kf_rgb_np], device, cam_only=False, store_cache=True,
-                keep=keep_for(kf_masks_np)
+                **keep_for(kf_masks_np)
             )
             if keyframe_cache is not None:
                 keyframe_cache.after_rebuild(capture_frame_ids, batch_conf,
@@ -791,7 +811,7 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
                 # model.kv_cache = last_kv
                 batch_pts3d , batch_pred_T_wc, batch_conf, batch_images_np, local_pts3d, origin_offset = pi3_inference(
                     model, [kf_rgb_np], device, cam_only=False, store_cache=True,
-                    keep=keep_for(kf_masks_np)
+                    **keep_for(kf_masks_np)
                 )
 
                 kf_masks = torch.tensor(kf_masks_np, device=device).bool()
