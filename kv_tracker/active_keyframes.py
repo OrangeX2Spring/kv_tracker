@@ -4,10 +4,10 @@ import torch
 
 
 class ActiveKeyframes:
-    def __init__(self, mode, quantile=.5):
-        assert mode in ('all', 'one', 'half', 'motion', 'alternate')
-        assert 0 < quantile < 1
-        self.mode, self.quantile = mode, quantile
+    def __init__(self, mode, quantile=.5, drop=None):
+        assert mode in ('all', 'one', 'half', 'motion', 'alternate', 'drop')
+        assert 0 < quantile < 1 and (drop is not None) == (mode == 'drop')
+        self.mode, self.quantile, self.drop = mode, quantile, drop
         self.count = 1
         self.scores = []
         self.events = []
@@ -38,11 +38,18 @@ class ActiveKeyframes:
             self.count = 1
         elif self.mode == 'half':
             self.count = max(1, (len(unique) + 1) // 2)
+        elif self.mode == 'drop':
+            # Leave-one-out: never remove the only available keyframe.
+            self.count = len(unique) - (len(unique) > 1 and self.drop in unique)
         elif decision:
             grow = score > threshold if self.mode == 'motion' else (frame // 8) % 2 == 1
             self.count = min(len(unique), max(1, self.count + (1 if grow else -1)))
         assert 1 <= self.count <= len(unique)
-        selected = [0] + (unique[-(self.count - 1):] if self.count > 1 else [])
+        if self.mode == 'drop':
+            selected = [f for f in unique if f != self.drop] if len(unique) > 1 else unique
+        else:
+            selected = [0] + (unique[-(self.count - 1):] if self.count > 1 else [])
+        assert len(selected) == self.count
         # Preserve BOTH native copies of frame0 at bootstrap: one unique keyframe.
         slots = [i for i, fid in enumerate(cached_ids) if fid in selected]
         self.saved = self.model.cache
@@ -60,7 +67,7 @@ class ActiveKeyframes:
                        + torch.arange(tokens, device=first.device)).flatten()
             self.model.cache = {i: {k: t.index_select(2, indices) for k, t in layer.items()}
                                 for i, layer in self.saved.items()}
-        self.events.append(dict(frame=frame, mode=self.mode, quantile=self.quantile,
+        self.events.append(dict(frame=frame, mode=self.mode, quantile=self.quantile, drop=self.drop,
             score=score, threshold=threshold, threshold_start_frame=max(1, frame - 64),
             threshold_end_frame=frame - 1, decision=decision, previous_count=previous_count,
             available_ids=unique, physical_ids=list(cached_ids), selected_ids=selected,
