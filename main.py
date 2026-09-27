@@ -196,7 +196,7 @@ def follower_cam(cur_T_wc, offset=np.array([0.0, 0.0, 0.5])):
 
 def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=None,
                keyframe_indices=None, keyframe_selector=None, keyframe_cache=None,
-               keyframe_append=None, cache_transform=None):
+               keyframe_append=None, cache_transform=None, active_keyframes=None):
 
     assert keyframe_indices is None or keyframe_selector is None
 
@@ -231,6 +231,10 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
     assert args.keep_background >= -1
     assert not args.background_mass or args.keep_background > 0
     token_drop.config.update(mass=args.background_mass, probe=None)
+    if active_keyframes is not None:
+        assert args.cam_only and not args.obj_mode and not args.token_drop
+        assert keyframe_cache is None and keyframe_append is None and cache_transform is None
+        assert frame_source is not None
     if keyframe_append is not None:
         # A1 is deliberately limited to fixed-ID scene/camera tracking.
         assert args.cam_only and not args.obj_mode and not args.sim3
@@ -367,6 +371,8 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
         cache_transform(model.cache, capture_frame_ids)
     if keyframe_selector is not None:
         keyframe_selector.bootstrap(keyframes[0])
+    if active_keyframes is not None:
+        active_keyframes.bootstrap(model, keyframes[0]["resized_rgb_masked_np"])
 
     kf_masks = torch.tensor(kf_masks_np, device=device).bool()
     obj_center = batch_pts3d[0][kf_masks].mean(dim=0)
@@ -459,6 +465,9 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
             keyframe_cache.begin_query(current_frame['idx'])
         if keyframe_append is not None:
             keyframe_append.begin_query(current_frame['idx'])
+        if active_keyframes is not None:
+            active_keyframes.begin(current_frame['idx'], capture_frame_ids,
+                                   current_frame['resized_rgb_masked_np'])
         inference_ret = pi3_inference(
             model,
             current_frame[tracking_frame_type].clone(),
@@ -469,6 +478,8 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
             **keep_for(current_frame["resized_mask"][None]),
         ) 
 
+        if active_keyframes is not None:
+            active_keyframes.end()
         if args.cam_only:
             pred_T_wc = inference_ret
         else:
