@@ -4,26 +4,31 @@ import torch
 
 
 class ActiveKeyframes:
-    def __init__(self, mode, quantile=.5, drop=None):
-        assert mode in ('all', 'one', 'half', 'motion', 'alternate', 'drop')
+    def __init__(self, mode, quantile=.5, drop=None, rank='newest'):
+        assert mode in ('all', 'one', 'two', 'half', 'motion', 'alternate', 'drop')
         assert 0 < quantile < 1 and (drop is not None) == (mode == 'drop')
-        self.mode, self.quantile, self.drop = mode, quantile, drop
+        # Visibility ranking replaces recency only for the fixed-size subsets.
+        assert rank in ('newest', 'visible') and (rank == 'newest' or mode in ('two', 'half'))
+        self.mode, self.quantile, self.drop, self.rank = mode, quantile, drop, rank
         self.count = 1
         self.scores = []
         self.events = []
         self.saved = None
+        self.visible = {}
 
-    def bootstrap(self, model, rgb):
+    def bootstrap(self, model, rgb, visible):
+        assert 0 <= visible <= 1
         self.model = model
         self.previous = self.thumbnail(rgb)
+        self.visible[0] = float(visible)
 
     @staticmethod
     def thumbnail(rgb):
         assert rgb.ndim == 3 and rgb.shape[-1] == 3 and rgb.dtype == np.uint8
         return rgb[::16, ::16].astype(np.float64).mean(-1) / 255.
 
-    def begin(self, frame, cached_ids, rgb):
-        assert self.saved is None and max(cached_ids) < frame
+    def begin(self, frame, cached_ids, rgb, visible):
+        assert self.saved is None and max(cached_ids) < frame and 0 <= visible <= 1
         unique = sorted(set(cached_ids))
         assert unique[0] == 0
         image = self.thumbnail(rgb)
@@ -36,6 +41,8 @@ class ActiveKeyframes:
             self.count = len(unique)
         elif self.mode == 'one':
             self.count = 1
+        elif self.mode == 'two':
+            self.count = min(2, len(unique))
         elif self.mode == 'half':
             self.count = max(1, (len(unique) + 1) // 2)
         elif self.mode == 'drop':
@@ -47,6 +54,10 @@ class ActiveKeyframes:
         assert 1 <= self.count <= len(unique)
         if self.mode == 'drop':
             selected = [f for f in unique if f != self.drop] if len(unique) > 1 else unique
+        elif self.rank == 'visible':
+            # Each keyframe's own visible fraction from its query frame; ties prefer newer.
+            ranked = sorted(unique[1:], key=lambda f: (-self.visible[f], -f))
+            selected = [0] + sorted(ranked[:self.count - 1])
         else:
             selected = [0] + (unique[-(self.count - 1):] if self.count > 1 else [])
         assert len(selected) == self.count
@@ -68,6 +79,7 @@ class ActiveKeyframes:
             self.model.cache = {i: {k: t.index_select(2, indices) for k, t in layer.items()}
                                 for i, layer in self.saved.items()}
         self.events.append(dict(frame=frame, mode=self.mode, quantile=self.quantile, drop=self.drop,
+            rank=self.rank, visible=float(visible), available_visible=[self.visible[f] for f in unique],
             score=score, threshold=threshold, threshold_start_frame=max(1, frame - 64),
             threshold_end_frame=frame - 1, decision=decision, previous_count=previous_count,
             available_ids=unique, physical_ids=list(cached_ids), selected_ids=selected,
@@ -77,6 +89,8 @@ class ActiveKeyframes:
             active_bytes=sum(t.numel() * t.element_size() for l in self.model.cache.values() for t in l.values())))
         self.scores.append(score)
         self.scores = self.scores[-64:]
+        # Recorded after selection: a frame is never available to its own query.
+        self.visible[frame] = float(visible)
 
     def end(self):
         assert self.saved is not None
