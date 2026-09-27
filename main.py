@@ -196,7 +196,7 @@ def follower_cam(cur_T_wc, offset=np.array([0.0, 0.0, 0.5])):
 
 def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=None,
                keyframe_indices=None, keyframe_selector=None, keyframe_cache=None,
-               keyframe_append=None):
+               keyframe_append=None, cache_transform=None):
 
     assert keyframe_indices is None or keyframe_selector is None
 
@@ -363,6 +363,8 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
     if keyframe_cache is not None:
         keyframe_cache.after_rebuild(capture_frame_ids, batch_conf,
                                      points=batch_pts3d, masks=kf_masks_np)
+    if cache_transform is not None:
+        cache_transform(model.cache, capture_frame_ids)
     if keyframe_selector is not None:
         keyframe_selector.bootstrap(keyframes[0])
 
@@ -645,6 +647,8 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
             if keyframe_cache is not None:
                 keyframe_cache.after_rebuild(capture_frame_ids, batch_conf,
                                              points=batch_pts3d, masks=kf_masks_np)
+            if cache_transform is not None:
+                cache_transform(model.cache, capture_frame_ids)
 
             kf_masks = torch.tensor(kf_masks_np, device=device).bool()
             obj_center = batch_pts3d[0][kf_masks].mean(dim=0)
