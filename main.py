@@ -196,7 +196,8 @@ def follower_cam(cur_T_wc, offset=np.array([0.0, 0.0, 0.5])):
 
 def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=None,
                keyframe_indices=None, keyframe_selector=None, keyframe_cache=None,
-               keyframe_append=None, cache_transform=None, active_keyframes=None):
+               keyframe_append=None, cache_transform=None, active_keyframes=None,
+               patch_cache=None):
 
     assert keyframe_indices is None or keyframe_selector is None
 
@@ -236,6 +237,12 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
         assert not args.token_drop and not args.crop_kf
         assert keyframe_cache is None and keyframe_append is None and cache_transform is None
         assert frame_source is not None
+    if patch_cache is not None:
+        # Selects patch rows after every native rebuild; admissions stay native.
+        assert frame_source is not None and not args.sim3
+        assert not args.token_drop and not args.crop_kf
+        assert keyframe_cache is None and keyframe_append is None
+        assert cache_transform is None and active_keyframes is None
     if keyframe_append is not None:
         # A1 is deliberately limited to fixed-ID scene/camera tracking.
         assert args.cam_only and not args.obj_mode and not args.sim3
@@ -319,6 +326,8 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
         keyframe_cache.attach(model)
     if keyframe_append is not None:
         keyframe_append.attach(model)
+    if patch_cache is not None:
+        patch_cache.attach(model)
 
     # Get Keyframes
     # =============
@@ -370,6 +379,8 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
                                      points=batch_pts3d, masks=kf_masks_np)
     if cache_transform is not None:
         cache_transform(model.cache, capture_frame_ids)
+    if patch_cache is not None:
+        patch_cache.after_rebuild(capture_frame_ids, batch_conf, batch_pts3d, kf_masks_np, kf_rgb_np)
     if keyframe_selector is not None:
         keyframe_selector.bootstrap(keyframes[0])
     if active_keyframes is not None:
@@ -467,6 +478,8 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
             keyframe_cache.begin_query(current_frame['idx'])
         if keyframe_append is not None:
             keyframe_append.begin_query(current_frame['idx'])
+        if patch_cache is not None:
+            patch_cache.begin_query(current_frame['idx'])
         if active_keyframes is not None:
             active_keyframes.begin(current_frame['idx'], capture_frame_ids,
                                    current_frame['resized_rgb_masked_np'],
@@ -483,6 +496,8 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
 
         if active_keyframes is not None:
             active_keyframes.end()
+        if patch_cache is not None:
+            patch_cache.end_query()
         if args.cam_only:
             pred_T_wc = inference_ret
         else:
@@ -663,6 +678,9 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
                                              points=batch_pts3d, masks=kf_masks_np)
             if cache_transform is not None:
                 cache_transform(model.cache, capture_frame_ids)
+            if patch_cache is not None:
+                patch_cache.after_rebuild(capture_frame_ids, batch_conf, batch_pts3d,
+                                          kf_masks_np, kf_rgb_np)
 
             kf_masks = torch.tensor(kf_masks_np, device=device).bool()
             obj_center = batch_pts3d[0][kf_masks].mean(dim=0)
