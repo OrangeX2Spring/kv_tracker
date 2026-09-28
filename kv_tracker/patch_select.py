@@ -316,6 +316,7 @@ queries in the final global block, on its causal query pass. Timed."""
             assert frame_ids == [0, 0]
             new = 0
             picked = torch.arange(total)
+            details = dict(budget=total)  # the anchor is dense
             if self.needs_features:
                 assert self.tokens.shape == (total, 1024)
                 if self.policy in ('K7', 'K8'):
