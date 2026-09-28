@@ -1,12 +1,20 @@
-"""Quarter-patch selection of historical keyframe K/V (screen designed 2026-09-28).
+"""Quarter-patch selection of historical keyframe K/V (screen designed 2026-09-28,
+object task amended 2026-09-29 after preflight 25993).
 
 Protocol: tools/SEMANTIC_KV_OVERNIGHT_PLAN.md in the parent repository. Keyframes
 are admitted by replaying the native schedule and every rebuild stays native and
 dense. Afterwards the persistent cache keeps the anchor densely and, for every
-later keyframe, its five register tokens plus exactly K = ceil(P/4) of its P
-ordinary patches, chosen once at admission. Rows are gathered from the post-RoPE
-cache, so kept keys keep their positions; nothing is averaged, rescaled or
-regenerated. Signals use the admitted frame and already observed history only.
+later keyframe, its five register tokens plus the patches its policy chooses once
+at admission:
+
+- scene: K = ceil(P/4) of all P patches;
+- object: K = ceil(P_obj/4) of the P_obj patches touching the SAM mask, chosen
+  by the policy, plus BACKGROUND evenly spaced background patches that every
+  object arm shares (token_drop.background_keep, as bg16 in job 25906).
+
+Rows are gathered from the post-RoPE cache, so kept keys keep their positions;
+nothing is averaged, rescaled or regenerated. Signals use the admitted frame and
+already observed history only.
 """
 import math
 import time
@@ -16,13 +24,16 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from kv_tracker.correspondence_cache import spatial_pick
+from kv_tracker.token_drop import background_keep
 
 PATCH = 14
 CELLS = 4
+SEEDS = (17, 29, 41, 53, 67, 79, 97, 113)
 CANDIDATES = tuple(f'K{i}' for i in range(1, 11))
-CONTROLS = ('all', 'uniform', 'random17', 'random29')
+# 'object_dense': every object patch plus the shared background; object task only.
+CONTROLS = ('all', 'uniform', 'object_dense') + tuple(f'random{s}' for s in SEEDS)
 POLICIES = CONTROLS + CANDIDATES
+BACKGROUND = 16
 MATCH_FLOOR = .9
 CLUSTERS = 8
 KMEANS_ITERATIONS = 5
@@ -73,10 +84,35 @@ def stratified(score, groups, count, eligible, weight=None):
     return torch.cat(picked) if picked else torch.zeros(0, dtype=torch.long)
 
 
+def even(eligible, count, cell):
+    """Cell quotas over eligible patches, then evenly spaced eligible patches
+inside each cell in raster order (the spatial-uniform control)."""
+    capacity = torch.bincount(cell[eligible], minlength=CELLS * CELLS)
+    quota = allocate(count, capacity, capacity)
+    picked = []
+    for g, q in enumerate(quota.tolist()):
+        if q:
+            members = (eligible & (cell == g)).nonzero().flatten()
+            picked.append(members[torch.linspace(0, len(members) - 1, q).round().long()])
+    return torch.cat(picked) if picked else torch.zeros(0, dtype=torch.long)
+
+
 def cells(grid):
     height, width = grid
     y, x = torch.meshgrid(torch.arange(height), torch.arange(width), indexing='ij')
     return ((y * CELLS // height) * CELLS + x * CELLS // width).flatten()
+
+
+def patches_of(values):
+    height, width = values.shape[:2]
+    assert height % PATCH == width % PATCH == 0
+    return values.reshape(height // PATCH, PATCH, width // PATCH, PATCH).transpose(
+        0, 2, 1, 3).reshape(-1, PATCH * PATCH)
+
+
+def mask_fraction(mask):
+    assert mask.dtype == bool and mask.ndim == 2
+    return torch.from_numpy(patches_of(mask).mean(1))
 
 
 def image_scores(rgb, mask):
@@ -88,42 +124,52 @@ Also returns each patch's mask fraction.
 """
     assert rgb.dtype == np.uint8 and rgb.ndim == 3 and rgb.shape[2] == 3
     assert mask.dtype == bool and mask.shape == rgb.shape[:2]
-    height, width = mask.shape
-    assert height % PATCH == width % PATCH == 0
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
     kernel = np.ones((2 * MASK_MARGIN + 1,) * 2, np.uint8)
-    valid = cv2.erode(mask.astype(np.uint8), kernel).astype(bool)
-    corner = cv2.cornerMinEigenVal(gray, blockSize=3, ksize=3)
-    magnitude = np.hypot(cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3),
-                         cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3))
-
-    def patches(values):
-        return values.reshape(height // PATCH, PATCH, width // PATCH, PATCH).transpose(
-            0, 2, 1, 3).reshape(-1, PATCH * PATCH)
-
-    valid, corner, magnitude = patches(valid), patches(corner), patches(magnitude)
+    valid = patches_of(cv2.erode(mask.astype(np.uint8), kernel).astype(bool))
+    corner = patches_of(cv2.cornerMinEigenVal(gray, blockSize=3, ksize=3))
+    magnitude = patches_of(np.hypot(cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3),
+                                    cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)))
     count = valid.sum(1)
     peak = np.where(valid, corner, -np.inf).max(1)
     mean = np.where(count > 0, np.where(valid, magnitude, 0).sum(1) / np.maximum(count, 1), -np.inf)
-    fraction = patches(mask).mean(1)
     return (torch.from_numpy(peak.astype(np.float64)), torch.from_numpy(mean.astype(np.float64)),
-            torch.from_numpy(fraction))
+            mask_fraction(mask))
 
 
-def feature_clusters(features, corner):
-    """Eight cosine clusters: farthest-point initialisation from the strongest
-corner, five assignment/update iterations; an empty cluster keeps its centre.
-Features stay on their device; labels return on the CPU."""
-    first = int(top(corner, 1, torch.ones(len(features), dtype=torch.bool))[0])
-    centres = features[farthest_points(lambda i: 1 - features @ features[i], first, CLUSTERS,
-                                       torch.ones(len(features), dtype=torch.bool))]
+def farthest_points(distance_to, first, count, eligible):
+    """Greedy farthest-point selection; `distance_to(i)` gives distances to patch i.
+The lower patch index wins ties."""
+    picked = [first]
+    distance = distance_to(first)
+    blocked = ~eligible.to(distance.device)
+    blocked[first] = True
+    for _ in range(1, count):
+        index = int(distance.masked_fill(blocked, -math.inf).argmax())
+        assert not blocked[index]
+        picked.append(index)
+        blocked[index] = True
+        distance = torch.minimum(distance, distance_to(index))
+    return torch.tensor(picked, dtype=torch.long)
+
+
+def feature_clusters(features, corner, eligible):
+    """Up to eight cosine clusters of the eligible patches: farthest-point
+initialisation from the strongest corner, five assignment/update iterations; an
+empty cluster keeps its centre. Labels (CPU) are meaningful on eligible patches."""
+    count = min(CLUSTERS, int(eligible.sum()))
+    first = int(top(corner, 1, eligible)[0])
+    centres = features[farthest_points(lambda i: 1 - features @ features[i], first, count, eligible)]
+    rows = eligible.nonzero().flatten()
+    members = features[rows]
     for _ in range(KMEANS_ITERATIONS):
-        labels = (features @ centres.T).argmax(1)
-        for c in range(CLUSTERS):
-            members = labels == c
-            if members.any():
-                centres[c] = F.normalize(features[members].mean(0), dim=0)
-    return (features @ centres.T).argmax(1).cpu()
+        labels = (members @ centres.T).argmax(1)
+        for c in range(count):
+            if (labels == c).any():
+                centres[c] = F.normalize(members[labels == c].mean(0), dim=0)
+    full = torch.zeros(len(features), dtype=torch.long)
+    full[rows] = (members @ centres.T).argmax(1).cpu()
+    return full
 
 
 def label_boundary(labels, grid):
@@ -155,22 +201,6 @@ def reciprocal_matches(features, previous):
     return matched.cpu(), link.cpu(), best.cpu()
 
 
-def farthest_points(distance_to, first, count, eligible):
-    """Greedy farthest-point selection; `distance_to(i)` gives distances to patch i.
-The lower patch index wins ties."""
-    picked = [first]
-    distance = distance_to(first)
-    blocked = ~eligible.to(distance.device)
-    blocked[first] = True
-    for _ in range(1, count):
-        index = int(distance.masked_fill(blocked, -math.inf).argmax())
-        assert not blocked[index]
-        picked.append(index)
-        blocked[index] = True
-        distance = torch.minimum(distance, distance_to(index))
-    return torch.tensor(picked, dtype=torch.long)
-
-
 def register_attention(block, x, xpos, cache, special):
     """Softmax of the special (register) queries over every key of a cached pass.
 
@@ -195,21 +225,22 @@ class PatchSelectCache:
 
     def __init__(self, policy, task, schedule):
         assert policy in POLICIES and task in ('object', 'scene')
+        assert policy != 'object_dense' or task == 'object'
         assert schedule[0] == 0 and schedule == sorted(set(schedule))
         self.policy = policy
         self.task = task
         self.schedule = list(schedule)
         self.selected = {}
         self.events = []
-        self.previous = None  # K7/K8: the most recent admission's descriptors
+        self.previous = None  # K7/K8: the latest admission's eligible descriptors
         self.retained = []    # K8: descriptors of every retained patch
         self.hooks = []
         self.frame = None
         self.tokens = None
         self.demand = None
         self.demand_seconds = 0.
-        self.needs_features = policy in ('K6', 'K7', 'K8') or (
-            policy in ('K4', 'K5') and task == 'scene')
+        self.needs_features = policy in ('K4', 'K5', 'K6', 'K7', 'K8') and not (
+            policy == 'K5' and task == 'object')
         # The bootstrap is the first forward and holds the anchor.
         self.capturing = self.needs_features
         self.measuring = False
@@ -261,6 +292,16 @@ queries in the final global block, on its causal query pass. Timed."""
             assert not self.capturing and not self.measuring
         self.capturing = self.measuring = False
 
+    def eligible(self, mask):
+        """Patches a policy chooses among: the object's (touching the mask) or all."""
+        fraction = mask_fraction(mask)
+        if self.task == 'scene':
+            assert mask.all()
+            return torch.ones(len(fraction), dtype=torch.bool)
+        eligible = fraction > 0
+        assert eligible.any()
+        return eligible
+
     def after_rebuild(self, frame_ids, confidence, points, masks, rgb):
         started = time.perf_counter()
         count = len(frame_ids)
@@ -270,7 +311,6 @@ queries in the final global block, on its causal query pass. Timed."""
         height, width = masks.shape[1:]
         grid = height // PATCH, width // PATCH
         total = math.prod(grid)
-        budget = math.ceil(total / 4)
         details = {}
         if not self.selected:
             assert frame_ids == [0, 0]
@@ -279,18 +319,18 @@ queries in the final global block, on its causal query pass. Timed."""
             if self.needs_features:
                 assert self.tokens.shape == (total, 1024)
                 if self.policy in ('K7', 'K8'):
-                    self.previous = dict(features=self.tokens,
-                                         age=torch.zeros(total, dtype=torch.long))
+                    rows = self.eligible(masks[0]).nonzero().flatten()
+                    self.previous = dict(features=self.tokens[rows.to(self.tokens.device)],
+                                         age=torch.zeros(len(rows), dtype=torch.long))
                 if self.policy == 'K8':
                     self.retained.append(self.tokens)
         else:
             new = frame_ids[-1]
             assert frame_ids[:-1] == list(self.selected)
             assert new == self.schedule[len(self.selected)] == self.frame
-            picked, details = self.choose(new, grid, budget, rgb[-1], masks[-1],
+            picked, details = self.choose(new, grid, rgb[-1], masks[-1],
                                           confidence[0, -1, ..., 0], points[0, -1])
-            assert len(picked) == len(set(picked.tolist())) == (
-                total if self.policy == 'all' else budget)
+            assert len(picked) == len(set(picked.tolist())) == details['budget']
             assert 0 <= int(picked.min()) and int(picked.max()) < total
         self.selected[new] = picked
         self.tokens = None
@@ -311,7 +351,7 @@ queries in the final global block, on its causal query pass. Timed."""
                 if len(indices) != tensor.shape[2]:
                     layer[name] = tensor.index_select(2, indices.to(tensor.device))
         self.events.append(dict(frame=new, policy=self.policy, retained_frame_ids=list(self.selected),
-            patches=total, budget=budget, selected=picked.tolist(), retained_tokens=len(indices),
+            patches=total, selected=picked.tolist(), retained_tokens=len(indices),
             dense_cache_bytes=dense_bytes, query_cache_bytes=self.cache_bytes(),
             state_bytes=self.state_bytes(),
             rebuild_input_bytes=int(masks.nbytes + rgb.nbytes),
@@ -319,24 +359,27 @@ queries in the final global block, on its causal query pass. Timed."""
             selector_host_seconds=time.perf_counter() - started, **details))
         self.demand_seconds = 0.
 
-    def choose(self, frame, grid, budget, rgb, mask, confidence, points):
+    def choose(self, frame, grid, rgb, mask, confidence, points):
         """Patch IDs (CPU, sorted) and diagnostics. Encoder features stay on
 their device; image scores and index bookkeeping are on the CPU."""
         total = math.prod(grid)
         policy = self.policy
         if policy == 'all':
-            return torch.arange(total), {}
+            return torch.arange(total), dict(budget=total)
         corner, gradient, fraction = image_scores(np.ascontiguousarray(rgb), mask)
-        if self.task == 'scene':
-            assert mask.all()
-        every = torch.ones(total, dtype=torch.bool)
+        eligible = self.eligible(mask)
+        budget = math.ceil(int(eligible.sum()) / 4)
         cell = cells(grid)
-        target = fraction >= .5
-        details = dict(corner_scored_patches=int(torch.isfinite(corner).sum()))
+        details = dict(corner_scored_patches=int(torch.isfinite(corner).sum()),
+                       eligible_patches=int(eligible.sum()), eligible_budget=budget)
+        background = torch.zeros(total, dtype=torch.bool)
+        if self.task == 'object':
+            # Shared by every object arm, so arms differ only inside the object.
+            background = background_keep(eligible[None], BACKGROUND)[1][0]
 
         def complete(picked, count):
-            """Fill to count with K2's ranking over patches not yet chosen."""
-            free = every.clone()
+            """Fill to count with K2's ranking over eligible patches not yet chosen."""
+            free = eligible.clone()
             free[picked] = False
             details['k2_fill'] = details.get('k2_fill', 0) + count - len(picked)
             return torch.cat((picked, stratified(corner, cell, count - len(picked), free)))
@@ -345,44 +388,52 @@ their device; image scores and index bookkeeping are on the CPU."""
         if self.needs_features:
             assert self.tokens.shape == (total, 1024)
             features = self.tokens
-        if policy == 'uniform':
-            none = torch.full((total,), -1, dtype=torch.long)
-            picked = spatial_pick(grid, budget, none, none.float(), torch.arange(total))
+        if policy == 'object_dense':
+            picked = eligible.nonzero().flatten()
+        elif policy == 'uniform':
+            picked = even(eligible, budget, cell)
         elif policy.startswith('random'):
             generator = torch.Generator().manual_seed(int(policy[6:]) * 1_000_000 + frame)
-            picked = torch.randperm(total, generator=generator)[:budget]
+            rows = eligible.nonzero().flatten()
+            picked = rows[torch.randperm(len(rows), generator=generator)[:budget]]
         elif policy == 'K1':
-            picked = top(corner, budget, every)
+            picked = top(corner, budget, eligible)
         elif policy == 'K2':
-            picked = stratified(corner, cell, budget, every)
+            picked = stratified(corner, cell, budget, eligible)
         elif policy == 'K3':
-            first = stratified(corner, cell, budget - budget // 2, every)
-            rest = every.clone()
+            first = stratified(corner, cell, budget - budget // 2, eligible)
+            rest = eligible.clone()
             rest[first] = False
             picked = torch.cat((first, stratified(gradient, cell, budget // 2, rest)))
-        elif policy in ('K4', 'K5'):
+        elif policy == 'K4':
+            # Equal-capacity-adjusted quotas over encoder-feature clusters.
+            labels = feature_clusters(features, corner, eligible)
+            details['cluster_sizes'] = torch.bincount(labels[eligible], minlength=CLUSTERS).tolist()
+            picked = stratified(corner, labels, budget, eligible, [1.] * CLUSTERS)
+        elif policy == 'K5':
             if self.task == 'object':
-                labels = target.long()
-                boundary = (fraction > 0) & (fraction < 1)
+                boundary = eligible & (fraction < 1)  # the mask edge crosses the patch
             else:
-                labels = feature_clusters(features, corner)
-                boundary = label_boundary(labels, grid)
-                details['cluster_sizes'] = torch.bincount(labels, minlength=CLUSTERS).tolist()
-            if policy == 'K4':
-                # Object: 75% target patches, 25% others. Scene: equal cluster quotas.
-                weight = [.25, .75] if self.task == 'object' else [1.] * CLUSTERS
-                picked = stratified(corner, labels, budget, every, weight)
-            else:
-                quota = allocate(budget, [int(boundary.sum()), int((~boundary).sum())], [1., 1.])
-                picked = torch.cat((stratified(corner, cell, int(quota[0]), boundary),
-                                    stratified(corner, cell, int(quota[1]), ~boundary)))
-                details['boundary_patches'] = int(boundary.sum())
+                boundary = label_boundary(feature_clusters(features, corner, eligible), grid)
+            inner = eligible & ~boundary
+            quota = allocate(budget, [int(boundary.sum()), int(inner.sum())], [1., 1.])
+            picked = torch.cat((stratified(corner, cell, int(quota[0]), boundary),
+                                stratified(corner, cell, int(quota[1]), inner)))
+            details['boundary_patches'] = int(boundary.sum())
         elif policy == 'K6':
-            first = int(top(corner, 1, every)[0])
-            picked = farthest_points(lambda i: 1 - features @ features[i], first, budget, every)
+            first = int(top(corner, 1, eligible)[0])
+            picked = farthest_points(lambda i: 1 - features @ features[i], first, budget, eligible)
         elif policy in ('K7', 'K8'):
-            matched, link, best = reciprocal_matches(features, self.previous['features'])
-            age = torch.where(matched, self.previous['age'][link] + 1, 0)
+            rows = eligible.nonzero().flatten()
+            current = features[rows.to(features.device)]
+            matched_rows, link, best_rows = reciprocal_matches(current, self.previous['features'])
+            age_rows = torch.where(matched_rows, self.previous['age'][link] + 1, 0)
+            matched = torch.zeros(total, dtype=torch.bool)
+            matched[rows] = matched_rows
+            best = torch.full((total,), -1.)
+            best[rows] = best_rows
+            age = torch.zeros(total, dtype=torch.long)
+            age[rows] = age_rows
             order = lexicographic(matched.nonzero().flatten(), (age.double(), best.double(), corner))
             persistent = budget if policy == 'K7' else budget - budget // 2
             picked = complete(order[:persistent], persistent)
@@ -391,13 +442,13 @@ their device; image scores and index bookkeeping are on the CPU."""
                 history = torch.cat(self.retained)
                 novelty = 1 - torch.cat([(chunk @ history.T).max(1).values
                                          for chunk in features.split(256)])
-                rest = every.clone()
+                rest = eligible.clone()
                 rest[picked] = False
                 picked = torch.cat((picked, top(novelty.double().cpu(), budget // 2, rest)))
-            self.previous = dict(features=features, age=age)
+            self.previous = dict(features=current, age=age_rows)
         elif policy == 'K9':
             assert self.demand is not None and self.demand.shape == (total,)
-            picked = top(self.demand.double().cpu(), budget, every)
+            picked = top(self.demand.double().cpu(), budget, eligible)
         else:
             assert policy == 'K10'
             xyz = points[PATCH // 2::PATCH, PATCH // 2::PATCH].detach().double().cpu()
@@ -409,19 +460,26 @@ their device; image scores and index bookkeeping are on the CPU."""
             steps = steps[steps > 0]
             spacing = float(steps.median()) if len(steps) else 1.
             xyz = (xyz / spacing).reshape(-1, 3)
-            finite = finite.flatten()
-            details.update(nonfinite_points=int((~finite).sum()), median_spacing=spacing)
-            if finite.any():
-                first = int(top(pooled.double(), 1, finite)[0])
-                count = min(budget, int(finite.sum()))
+            usable = finite.flatten() & eligible
+            details.update(nonfinite_points=int((eligible & ~finite.flatten()).sum()),
+                           median_spacing=spacing)
+            if usable.any():
+                first = int(top(pooled.double(), 1, usable)[0])
+                count = min(budget, int(usable.sum()))
                 picked = complete(farthest_points(lambda i: (xyz - xyz[i]).norm(dim=-1),
-                                                  first, count, finite), budget)
+                                                  first, count, usable), budget)
             else:
                 picked = complete(torch.zeros(0, dtype=torch.long), budget)
+        assert not background[picked].any() and eligible[picked].all()
+        assert len(picked) == (int(eligible.sum()) if policy == 'object_dense' else budget)
+        picked = torch.cat((picked, background.nonzero().flatten()))
         if policy == 'K8':
             self.retained.append(self.tokens[picked.to(self.tokens.device)])
         picked = picked.sort().values
-        details.update(weak_corner_selected=int((corner[picked] <= 1e-6).sum()),
+        target = fraction >= .5
+        details.update(budget=len(picked), background_kept=int(background.sum()),
+                       eligible_selected=int(eligible[picked].sum()),
+                       weak_corner_selected=int((corner[picked] <= 1e-6).sum()),
                        target_selected=int(target[picked].sum()), target_patches=int(target.sum()))
         return picked, details
 
