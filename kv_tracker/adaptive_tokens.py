@@ -103,6 +103,16 @@ def sensitivity(model, imgs, use_cache):
     skew part of R0^T R. The detached reference avoids log singularities at 0.
     Translation is in Pi3 units, rotation in radians (no fitted normalization).
     """
+    from kv_tracker.oracle_rope import OracleRoPE, cuRoPE2D
+
+    if not isinstance(model.rope, OracleRoPE):
+        original = model.rope
+        assert isinstance(original, cuRoPE2D)
+        replacement = OracleRoPE(freq=original.base, F0=original.F0)
+        # Pi3 shares this module across decoder and head attention layers.
+        for module in list(model.modules()):
+            if getattr(module, 'rope', None) is original:
+                module.rope = replacement
     n, p = imgs.shape[1], (imgs.shape[-2] // PATCH) * (imgs.shape[-1] // PATCH)
     with torch.enable_grad():
         gates = torch.ones(n, p, device=imgs.device, requires_grad=True)
