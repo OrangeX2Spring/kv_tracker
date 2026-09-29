@@ -96,12 +96,14 @@ def merge_groups(confidence, object_patches, task, grid):
     return keep, mapping
 
 
-def sensitivity(model, imgs, use_cache):
+def sensitivity(model, imgs, use_cache, *, deterministic_backward=True):
     """Six local se(3) derivatives per frame, summed in absolute value.
 
     Log(T0^-1 T) has this differential at T=T0: body translation and the
     skew part of R0^T R. The detached reference avoids log singularities at 0.
     Translation is in Pi3 units, rotation in radians (no fitted normalization).
+    Strict deterministic backward prevents atomic-reduction noise from changing
+    the ranking. The opt-out is for the repeatability diagnostic only.
     """
     from kv_tracker.oracle_rope import OracleRoPE, cuRoPE2D
 
@@ -126,11 +128,17 @@ def sensitivity(model, imgs, use_cache):
                              r[:, 1, 0] - r[:, 0, 1]), -1) / 2
         xi = torch.cat((t, omega), -1)
         score = torch.zeros_like(gates)
-        for frame in range(n):
-            for component in range(6):
-                gradient, = torch.autograd.grad(xi[frame, component], gates,
-                    retain_graph=not (frame == n - 1 and component == 5))
-                score[frame] += gradient[frame].abs()
+        deterministic = torch.are_deterministic_algorithms_enabled()
+        warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+        torch.use_deterministic_algorithms(deterministic_backward, warn_only=False)
+        try:
+            for frame in range(n):
+                for component in range(6):
+                    gradient, = torch.autograd.grad(xi[frame, component], gates,
+                        retain_graph=not (frame == n - 1 and component == 5))
+                    score[frame] += gradient[frame].abs()
+        finally:
+            torch.use_deterministic_algorithms(deterministic, warn_only=warn_only)
     assert torch.isfinite(score).all()
     return score.detach()
 
