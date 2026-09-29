@@ -18,6 +18,7 @@ import json
 import math
 
 import torch
+from torch.utils.checkpoint import checkpoint
 
 from pi3.utils.geometry import homogenize_points
 
@@ -142,7 +143,12 @@ class Probe:
 
 
 def forward_kept(model, imgs, keep, cam_only=False, store_cache=False, use_cache=False,
-                 background=None):
+                 background=None, gates=None, groups=None):
+    """Optional diagnostic gates act after the full encoder; groups map each
+    original patch to a kept representative, merging after encoder block 15.
+    Groups add log group-size bias in the decoder and replicate head features.
+    Neither diagnostic changes the default original-token path.
+    """
     B, N, _, H, W = imgs.shape
     h, w = H // PATCH, W // PATCH
     assert B == 1 and H % PATCH == 0 and W % PATCH == 0, imgs.shape
@@ -151,6 +157,11 @@ def forward_kept(model, imgs, keep, cam_only=False, store_cache=False, use_cache
     if background is None:
         background = torch.zeros_like(keep)
     assert background.shape == keep.shape and not (background & ~keep).any()
+    if gates is not None:
+        assert gates.shape == keep.shape and gates.dtype == torch.float32
+        assert keep.all() and not store_cache and groups is None
+    if groups is not None:
+        assert len(groups) == N and not config["mass"] and config["probe"] is None
     encoder = model.encoder
     assert not encoder.chunked_blocks
     start = 1 + encoder.num_register_tokens
@@ -185,18 +196,37 @@ def forward_kept(model, imgs, keep, cam_only=False, store_cache=False, use_cache
             assert count > 0, "the mass correction needs kept background"
             weight = math.log((h * w - int(obj[n].sum())) / count)
             biases.append((labels[-1] == BACKGROUND).to(dtype)[None, None, None] * weight)
-    mass = biases if config["mass"] else [None] * N
+    if groups is not None:
+        for n, mapping in enumerate(groups):
+            assert mapping.shape == (h * w,) and mapping.dtype == torch.long
+            assert ((mapping >= -1) & (mapping < len(index[n]))).all()
+            counts = torch.bincount(mapping[mapping >= 0], minlength=len(index[n]))
+            assert (counts > 0).all()
+            biases.append(torch.cat([counts.new_ones(special), counts]).to(dtype).log()[None, None, None])
+    mass = biases if config["mass"] or groups is not None else [None] * N
 
     imgs = (imgs - model.image_mean) / model.image_std
 
-    # Encoder: frames are independent, so each runs on its own kept tokens.
+    # ATD prunes before the encoder. The comparison merges after block 15.
     tokens = []
     for n in range(N):
         x = encoder.prepare_tokens_with_masks(imgs[0, n:n + 1])
-        x = torch.cat([x[:, :start], x[:, start:][:, index[n]]], dim=1)
-        for blk in encoder.blocks:
+        if groups is None:
+            patches = x[:, start:][:, index[n]]
+        else:
+            assert len(encoder.blocks) >= 15
+            for blk in encoder.blocks[:15]:
+                x = blk(x)
+            mapping = groups[n]
+            valid = mapping >= 0
+            patches = x.new_zeros(1, len(index[n]), x.shape[-1])
+            patches.index_add_(1, mapping[valid], x[:, start:][:, valid])
+            patches = patches / torch.bincount(mapping[valid], minlength=len(index[n]))[None, :, None]
+        x = torch.cat([x[:, :start], patches], dim=1)
+        for blk in (encoder.blocks if groups is None else encoder.blocks[15:]):
             x = blk(x)
-        tokens.append(encoder.norm(x)[:, start:])
+        encoded = encoder.norm(x)[:, start:]
+        tokens.append(encoded if gates is None else encoded.detach() * gates[n][None, :, None])
 
     # Decoder: even blocks attend within a frame, odd blocks across frames and cache.
     grid = model.position_getter(1, h, w, imgs.device)[0] + 1
@@ -207,7 +237,7 @@ def forward_kept(model, imgs, keep, cam_only=False, store_cache=False, use_cache
     lengths = [x.shape[1] for x in hidden]
     joint_labels = torch.cat(labels)
     joint_distance = torch.cat(distances) if probe is not None else None
-    joint_bias = torch.cat(biases, dim=-1) if config["mass"] else None
+    joint_bias = torch.cat(biases, dim=-1) if biases else None
     if use_cache:
         previous = model.kept_cache
         key_labels = torch.cat([previous["labels"], joint_labels])
@@ -221,7 +251,9 @@ def forward_kept(model, imgs, keep, cam_only=False, store_cache=False, use_cache
     last = []
     for i, blk in enumerate(model.decoder):
         if i % 2 == 0:
-            hidden = [blk(x, xpos=p, attn_mask=b) for x, p, b in zip(hidden, pos, mass)]
+            hidden = [(checkpoint(blk, x, xpos=p, attn_mask=b, use_reentrant=False)
+                       if gates is not None else blk(x, xpos=p, attn_mask=b))
+                      for x, p, b in zip(hidden, pos, mass)]
         else:
             x, p = torch.cat(hidden, dim=1), torch.cat(pos, dim=1)
             if probing:
@@ -231,9 +263,14 @@ def forward_kept(model, imgs, keep, cam_only=False, store_cache=False, use_cache
                 x, k, v = blk(x, xpos=p, ret_kv=True, attn_mask=key_bias)
                 model.cache[i] = {"k": k, "v": v}
             elif use_cache:
-                x = blk(x, xpos=p, kv_cache=model.cache[i], ret_kv=False, attn_mask=key_bias)
+                if gates is not None:
+                    x = checkpoint(blk, x, xpos=p, kv_cache=model.cache[i], ret_kv=False,
+                                   attn_mask=key_bias, use_reentrant=False)
+                else:
+                    x = blk(x, xpos=p, kv_cache=model.cache[i], ret_kv=False, attn_mask=key_bias)
             else:
-                x = blk(x, xpos=p, attn_mask=key_bias)
+                x = (checkpoint(blk, x, xpos=p, attn_mask=key_bias, use_reentrant=False)
+                     if gates is not None else blk(x, xpos=p, attn_mask=key_bias))
             hidden = list(torch.split(x, lengths, dim=1))
         if i + 1 >= len(model.decoder) - 1:
             last.append(hidden)
@@ -241,7 +278,8 @@ def forward_kept(model, imgs, keep, cam_only=False, store_cache=False, use_cache
 
     poses = []
     for x, p, b in zip(hidden, pos, mass):
-        camera = model.camera_decoder(x, xpos=p, attn_mask=b)
+        camera = (checkpoint(model.camera_decoder, x, xpos=p, attn_mask=b, use_reentrant=False)
+                  if gates is not None else model.camera_decoder(x, xpos=p, attn_mask=b))
         with torch.amp.autocast(device_type="cuda", enabled=False):
             poses.append(model.camera_head(camera.float()[:, special:], h, w))
     camera_poses = torch.cat(poses).reshape(1, N, 4, 4)
@@ -257,11 +295,16 @@ def forward_kept(model, imgs, keep, cam_only=False, store_cache=False, use_cache
             with torch.amp.autocast(device_type="cuda", enabled=False):
                 y = y.float()[:, special:]
                 full = y.new_zeros(1, h * w, y.shape[-1])
-                full[:, index[n]] = y
+                if groups is None:
+                    full[:, index[n]] = y
+                else:
+                    valid = groups[n] >= 0
+                    full[:, valid] = y[:, groups[n][valid]]
                 out.append(head([full], (H, W)).reshape(1, H, W, dim))
         return torch.cat(out).reshape(1, N, H, W, dim)
 
-    pixel = keep.reshape(N, h, 1, w, 1).expand(N, h, PATCH, w, PATCH).reshape(1, N, H, W, 1)
+    coverage = keep if groups is None else torch.stack([g >= 0 for g in groups])
+    pixel = coverage.reshape(N, h, 1, w, 1).expand(N, h, PATCH, w, PATCH).reshape(1, N, H, W, 1)
     ret = dense(model.point_decoder, model.point_head, 3)
     conf = dense(model.conf_decoder, model.conf_head, 1)
     with torch.amp.autocast(device_type="cuda", enabled=False):

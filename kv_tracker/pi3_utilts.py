@@ -26,7 +26,7 @@ def move_pi3_mlps_to_bfloat32(model):
 
     return model
 
-def pi3_inference(model, images_np_list, device, cam_only=False, store_cache=False, use_cache=False, tokens_mask=None, keep=None, background=None, **pi_kwargs):
+def pi3_inference(model, images_np_list, device, cam_only=False, store_cache=False, use_cache=False, tokens_mask=None, keep=None, background=None, token_policy=None, policy_masks=None, frame_ids=None, **pi_kwargs):
     """``keep`` (N, h*w) bool runs only those patches; ``background`` marks kept
     patches outside the object. See kv_tracker.token_drop."""
 
@@ -42,7 +42,11 @@ def pi3_inference(model, images_np_list, device, cam_only=False, store_cache=Fal
 
     with torch.no_grad():
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            if keep is None:
+            if token_policy is not None:
+                assert keep is None and tokens_mask is None and not pi_kwargs
+                results = token_policy.forward(model, images_tensor, policy_masks, frame_ids,
+                                               cam_only, store_cache, use_cache)
+            elif keep is None:
                 results = model(images_tensor, cam_only=cam_only, store_cache=store_cache, use_cache=use_cache, tokens_mask=tokens_mask, **pi_kwargs)
             else:
                 assert tokens_mask is None and not pi_kwargs

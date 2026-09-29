@@ -197,7 +197,7 @@ def follower_cam(cur_T_wc, offset=np.array([0.0, 0.0, 0.5])):
 def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=None,
                keyframe_indices=None, keyframe_selector=None, keyframe_cache=None,
                keyframe_append=None, cache_transform=None, active_keyframes=None,
-               patch_cache=None):
+               patch_cache=None, token_policy=None):
 
     assert keyframe_indices is None or keyframe_selector is None
 
@@ -252,8 +252,15 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
         assert frame_source is not None and keyframe_selector is not None
         assert keyframe_selector.fixed_indices == keyframe_append.indices
 
-    def keep_for(masks):
+    if token_policy is not None:
+        assert frame_source is not None and not args.token_drop and not args.crop_kf
+        assert keyframe_cache is None and keyframe_append is None
+        assert active_keyframes is None and cache_transform is None and patch_cache is None
+
+    def keep_for(masks, frame_ids):
         # (N, H, W) masks at Pi3 input size; no keep computes every patch, as upstream.
+        if token_policy is not None:
+            return dict(token_policy=token_policy, policy_masks=masks, frame_ids=frame_ids)
         if not args.token_drop:
             return {}
         keep = patch_keep(torch.as_tensor(masks, device=device).bool())
@@ -372,7 +379,7 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
 
     batch_pts3d, batch_pred_T_wc, batch_conf, batch_images_np, local_pts3d, origin_offset = pi3_inference(
         model, [kf_rgb_np], device, cam_only=False, store_cache=True, tokens_mask=None,
-        **keep_for(kf_masks_np)
+        **keep_for(kf_masks_np, capture_frame_ids)
     )
     if keyframe_cache is not None:
         keyframe_cache.after_rebuild(capture_frame_ids, batch_conf,
@@ -491,7 +498,7 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
             cam_only=args.cam_only,
             store_cache=False,
             use_cache=True,
-            **keep_for(current_frame["resized_mask"][None]),
+            **keep_for(current_frame["resized_mask"][None], [current_frame["idx"]]),
         ) 
 
         if active_keyframes is not None:
@@ -620,7 +627,7 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
                     # Replace K/V. scene_origin and recorded poses stay unchanged;
                     # origin_offset too unless re-anchored as a native rebuild does.
                     refresh_T_wc = pi3_inference(model, [kf_rgb_np], device, cam_only=True,
-                                                 store_cache=True, **keep_for(kf_masks_np))
+                                                 store_cache=True, **keep_for(kf_masks_np, capture_frame_ids))
                     torch.cuda.synchronize()
                     refresh_seconds = perf_counter() - refresh_started
                     assert refresh_T_wc.shape == (1, len(capture_frame_ids), 4, 4)
@@ -671,7 +678,7 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
 
             batch_pts3d , batch_pred_T_wc, batch_conf, batch_images_np, local_pts3d, origin_offset = pi3_inference(
                 model, [kf_rgb_np], device, cam_only=False, store_cache=True,
-                **keep_for(kf_masks_np)
+                **keep_for(kf_masks_np, capture_frame_ids)
             )
             if keyframe_cache is not None:
                 keyframe_cache.after_rebuild(capture_frame_ids, batch_conf,
@@ -847,7 +854,7 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
                 # model.kv_cache = last_kv
                 batch_pts3d , batch_pred_T_wc, batch_conf, batch_images_np, local_pts3d, origin_offset = pi3_inference(
                     model, [kf_rgb_np], device, cam_only=False, store_cache=True,
-                    **keep_for(kf_masks_np)
+                    **keep_for(kf_masks_np, capture_frame_ids)
                 )
 
                 kf_masks = torch.tensor(kf_masks_np, device=device).bool()
