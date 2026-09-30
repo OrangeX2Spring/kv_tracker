@@ -145,7 +145,7 @@ def sensitivity(model, imgs, use_cache, *, deterministic_backward=True):
 
 class AdaptiveTokens:
     def __init__(self, policy, task, log, query_executor=None):
-        assert policy in ARMS and task in ('object', 'scene')
+        assert policy in ARMS + ('oracle_spread',) and task in ('object', 'scene')
         self.policy, self.task, self.log = policy, task, log
         self.query_executor = query_executor
         if query_executor is not None:
@@ -175,7 +175,7 @@ class AdaptiveTokens:
         started = time.perf_counter()
         old_cache = model.cache
         old_metadata = getattr(model, 'kept_cache', None)
-        teacher = self.policy in ('oracle', 'come')
+        teacher = self.policy in ('oracle', 'oracle_spread', 'come')
         scores = {}
         if teacher:
             model.cache = self.teacher_cache
@@ -184,7 +184,7 @@ class AdaptiveTokens:
             for n, frame in enumerate(frame_ids):
                 if frame not in self.saved and frame not in scores:
                     one = imgs[:, n:n + 1]
-                    if self.policy == 'oracle':
+                    if self.policy in ('oracle', 'oracle_spread'):
                         scores[frame] = sensitivity(model, one, use_cache)[0]
                     else:
                         dense = forward_kept(model, one, torch.ones(1, p, device=imgs.device,
