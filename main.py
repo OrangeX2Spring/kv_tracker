@@ -197,7 +197,7 @@ def follower_cam(cur_T_wc, offset=np.array([0.0, 0.0, 0.5])):
 def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=None,
                keyframe_indices=None, keyframe_selector=None, keyframe_cache=None,
                keyframe_append=None, cache_transform=None, active_keyframes=None,
-               patch_cache=None, token_policy=None, scene_observer=None):
+               patch_cache=None, token_policy=None, scene_observer=None, pi3_model=None):
 
     assert keyframe_indices is None or keyframe_selector is None
 
@@ -330,8 +330,15 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
         assert not args.manual_kf
         frame_source = iter(frame_source)
 
-    model = load_pi3_from_pretrained(device).eval()
-    model = move_pi3_mlps_to_bfloat32(model)
+    if pi3_model is None:
+        model = load_pi3_from_pretrained(device).eval()
+        model = move_pi3_mlps_to_bfloat32(model)
+    else:
+        # Repeated training episodes share frozen weights, never episode state.
+        assert frame_source is not None and not pi3_model.training
+        model = pi3_model
+        model.cache = {}
+        model.kept_cache = None
     if keyframe_selector is not None:
         keyframe_selector.attach(model)
     if keyframe_cache is not None:
