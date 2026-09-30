@@ -144,9 +144,12 @@ def sensitivity(model, imgs, use_cache, *, deterministic_backward=True):
 
 
 class AdaptiveTokens:
-    def __init__(self, policy, task, log):
+    def __init__(self, policy, task, log, query_executor=None):
         assert policy in ARMS and task in ('object', 'scene')
         self.policy, self.task, self.log = policy, task, log
+        self.query_executor = query_executor
+        if query_executor is not None:
+            assert task == 'scene' and policy in ('all', 'uniform')
         self.saved = {}
         self.teacher_cache = {}
         self.teacher_metadata = None
@@ -159,6 +162,8 @@ class AdaptiveTokens:
     def forward(self, model, imgs, masks, frame_ids, cam_only, store_cache, use_cache):
         assert imgs.shape[0] == 1 and len(frame_ids) == imgs.shape[1]
         assert not (store_cache and use_cache)
+        if store_cache and self.query_executor is not None:
+            self.query_executor.reset()
         if not self.frozen:
             model.requires_grad_(False)
             self.frozen = True
@@ -228,8 +233,12 @@ class AdaptiveTokens:
             assert all(v['k'].shape[2] == cached for v in model.cache.values())
         torch.cuda.synchronize()
         started = time.perf_counter()
-        output = forward_kept(model, imgs, keep, cam_only=cam_only, store_cache=store_cache,
-                              use_cache=use_cache, groups=groups)
+        if use_cache and self.query_executor is not None:
+            assert cam_only and groups is None
+            output = self.query_executor.forward(model, imgs, keep)
+        else:
+            output = forward_kept(model, imgs, keep, cam_only=cam_only, store_cache=store_cache,
+                                  use_cache=use_cache, groups=groups)
         torch.cuda.synchronize()
         seconds = time.perf_counter() - started
         self.student_seconds += seconds
