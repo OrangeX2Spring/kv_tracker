@@ -143,17 +143,21 @@ class Probe:
 
 
 def forward_kept(model, imgs, keep, cam_only=False, store_cache=False, use_cache=False,
-                 background=None, gates=None, groups=None, query_indices=None):
+                 background=None, gates=None, groups=None, query_indices=None,
+                 defer_camera_head=False):
     """Optional diagnostic gates act after the full encoder; groups map each
     original patch to a kept representative, merging after encoder block 15.
     Groups add log group-size bias in the decoder and replicate head features.
     Neither diagnostic changes the default original-token path.
+    Fixed-index queries can return fp32 camera_features for the unchanged camera
+    head to run outside CUDA capture; its SVD cannot be captured in the CAMP image.
     """
     B, N, _, H, W = imgs.shape
     h, w = H // PATCH, W // PATCH
     assert B == 1 and H % PATCH == 0 and W % PATCH == 0, imgs.shape
     assert keep.dtype == torch.bool and keep.shape == (N, h * w), (keep.dtype, keep.shape)
     assert not (store_cache and use_cache)
+    assert not defer_camera_head or query_indices is not None
     if query_indices is not None:
         # Fixed-size CUDA Graph query boundary. Caller validates sorted unique
         # in-range indices before copying into this persistent device buffer.
@@ -295,6 +299,8 @@ def forward_kept(model, imgs, keep, cam_only=False, store_cache=False, use_cache
         camera = (checkpoint(model.camera_decoder, x, xpos=p, attn_mask=b, use_reentrant=False)
                   if gates is not None else model.camera_decoder(x, xpos=p, attn_mask=b))
         with torch.amp.autocast(device_type="cuda", enabled=False):
+            if defer_camera_head:
+                return dict(camera_features=camera.float()[:, special:])
             poses.append(model.camera_head(camera.float()[:, special:], h, w))
     camera_poses = torch.cat(poses).reshape(1, N, 4, 4)
     if cam_only:
