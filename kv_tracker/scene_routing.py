@@ -6,7 +6,7 @@ import numpy as np
 import torch
 
 
-def project_cache(points, confidence, pose, intrinsics, height, width):
+def project_cache(points, confidence, pose, intrinsics, height, width, distortion=None):
     """One evidence sample per source patch; nearest target patch, two depths.
 
     points and camera-to-world pose must share a coordinate gauge. Missing
@@ -16,11 +16,22 @@ def project_cache(points, confidence, pose, intrinsics, height, width):
     assert confidence.shape == points.shape[:1] and pose.shape == (4, 4)
     assert points.dtype == pose.dtype == intrinsics.dtype == torch.float32
     assert height % 14 == width % 14 == 0
+    if distortion is not None:
+        assert distortion.shape == (5,) and distortion.dtype == torch.float32
+        assert distortion.device == points.device
     camera = (points - pose[:3, 3]) @ pose[:3, :3]
     z = camera[:, 2]
     positive = z > 0
     safe_z = torch.where(positive, z, torch.ones_like(z))
     uv = camera[:, :2] / safe_z[:, None]
+    if distortion is not None:
+        # Brown-Conrady RGB distortion in normalized camera coordinates.
+        x, y = uv.unbind(1)
+        k1, k2, p1, p2, k3 = distortion.unbind()
+        r2 = x * x + y * y
+        radial = 1 + k1 * r2 + k2 * r2 * r2 + k3 * r2 * r2 * r2
+        uv = torch.stack((x * radial + 2 * p1 * x * y + p2 * (r2 + 2 * x * x),
+                          y * radial + p1 * (r2 + 2 * y * y) + 2 * p2 * x * y), 1)
     uv = uv * intrinsics.diag()[:2] + intrinsics[:2, 2]
     valid = (torch.isfinite(camera).all(1) & torch.isfinite(uv).all(1) & positive &
              (uv[:, 0] >= -.5) & (uv[:, 0] < width - .5) &
@@ -55,9 +66,10 @@ def project_cache(points, confidence, pose, intrinsics, height, width):
 
 
 class SceneRoutingObserver:
-    def __init__(self, directory, intrinsics, height, width):
+    def __init__(self, directory, intrinsics, height, width, distortion=None):
         self.directory, self.intrinsics = directory, intrinsics
         self.height, self.width = height, width
+        self.distortion = distortion
         self.rebuild_id = 0
         self.rows = []
 
@@ -79,7 +91,7 @@ class SceneRoutingObserver:
         torch.cuda.synchronize()
         started = time.perf_counter()
         maps = project_cache(self.points, self.confidence, self.pose,
-                             self.intrinsics, self.height, self.width)
+                             self.intrinsics, self.height, self.width, self.distortion)
         torch.cuda.synchronize()
         seconds = time.perf_counter() - started
         np.savez(self.directory / f'route_{frame:06d}.npz',
@@ -88,7 +100,9 @@ class SceneRoutingObserver:
             routing_seconds=seconds, supported_fraction=float((maps['support'] > 0).float().mean()),
             valid_fraction=float(maps['valid_samples'].float().mean()),
             metadata_bytes=sum(t.numel() * t.element_size() for t in
-                               (self.points, self.confidence, self.pose, self.intrinsics))))
+                               (self.points, self.confidence, self.pose, self.intrinsics)) +
+                           (0 if self.distortion is None else
+                            self.distortion.numel() * self.distortion.element_size())))
         (self.directory / 'routing.json').write_text(json.dumps(self.rows, indent=2))
 
     def after_query(self, poses):
