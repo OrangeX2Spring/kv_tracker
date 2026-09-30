@@ -55,9 +55,9 @@ def select(score, object_patches, task, policy, grid, frame):
         generator = torch.Generator().manual_seed(int(policy[6:]) + frame * 1009)
         chosen = eligible[torch.randperm(len(eligible), generator=generator).to(score.device)[:remaining]]
     else:
-        assert policy in ('heuristic', 'oracle')
-        # The heuristic reserves half its scene budget for spread context.
-        high = remaining // 2 if policy == 'heuristic' else remaining
+        assert policy in ('heuristic', 'oracle', 'oracle_spread')
+        # Diagnostic spread teacher matches the learned scorer's coverage rule.
+        high = remaining // 2 if policy in ('heuristic', 'oracle_spread') else remaining
         chosen = eligible[score[eligible].argsort(descending=True, stable=True)[:high]]
     dense[chosen] = True
     return keep_set(dense, count, grid)
