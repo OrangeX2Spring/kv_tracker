@@ -197,7 +197,7 @@ def follower_cam(cur_T_wc, offset=np.array([0.0, 0.0, 0.5])):
 def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=None,
                keyframe_indices=None, keyframe_selector=None, keyframe_cache=None,
                keyframe_append=None, cache_transform=None, active_keyframes=None,
-               patch_cache=None, token_policy=None):
+               patch_cache=None, token_policy=None, scene_observer=None):
 
     assert keyframe_indices is None or keyframe_selector is None
 
@@ -251,6 +251,11 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
         assert keyframe_cache is None and snapshot_callback is None
         assert frame_source is not None and keyframe_selector is not None
         assert keyframe_selector.fixed_indices == keyframe_append.indices
+
+    if scene_observer is not None:
+        assert args.cam_only and not args.obj_mode and not args.sim3 and frame_source is not None
+        assert not args.token_drop and not args.crop_kf
+        assert token_policy is None and patch_cache is None and keyframe_append is None
 
     if token_policy is not None:
         assert frame_source is not None and not args.token_drop and not args.crop_kf
@@ -406,6 +411,9 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
 
     # offset the scene to be centered around the object
 
+    if scene_observer is not None:
+        scene_observer.rebuild(capture_frame_ids, batch_pts3d, batch_conf, batch_pred_T_wc)
+
     initial_point_conf = batch_conf.clone() if snapshot_callback is not None else None
     batch_conf = batch_conf.squeeze()
     batch_conf[~kf_masks] = 0.0
@@ -491,6 +499,8 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
             active_keyframes.begin(current_frame['idx'], capture_frame_ids,
                                    current_frame['resized_rgb_masked_np'],
                                    current_frame['visible_fraction'])
+        if scene_observer is not None:
+            scene_observer.before_query(current_frame["idx"])
         inference_ret = pi3_inference(
             model,
             current_frame[tracking_frame_type].clone(),
@@ -540,6 +550,8 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
             pred_pts3d = current_sim3_s * (pred_pts3d @ current_sim3_R.T) + current_sim3_t
             pred_pts3d = pred_pts3d.to(torch.float32)
 
+        if scene_observer is not None:
+            scene_observer.after_query(pred_T_wc)
         T_w2c = pred_T_wc.squeeze().cpu().numpy()
         if snapshot_callback is not None and not args.cam_only:
             snapshot_callback("queries", [current_frame["idx"]], pred_pts3d,
@@ -813,6 +825,8 @@ def run_track3r(cfg = None, args = None, frame_source=None, snapshot_callback=No
                     color=[255, 0, 0],
                 )
 
+            if scene_observer is not None:
+                scene_observer.rebuild(capture_frame_ids, batch_pts3d, batch_conf, batch_pred_T_wc)
             if keyframe_selector is not None:
                 selector_obj_center = batch_pts3d[0][kf_masks].mean(dim=0)
             if snapshot_callback is not None:

@@ -143,7 +143,7 @@ class Probe:
 
 
 def forward_kept(model, imgs, keep, cam_only=False, store_cache=False, use_cache=False,
-                 background=None, gates=None, groups=None):
+                 background=None, gates=None, groups=None, query_indices=None):
     """Optional diagnostic gates act after the full encoder; groups map each
     original patch to a kept representative, merging after encoder block 15.
     Groups add log group-size bias in the decoder and replicate head features.
@@ -154,9 +154,19 @@ def forward_kept(model, imgs, keep, cam_only=False, store_cache=False, use_cache
     assert B == 1 and H % PATCH == 0 and W % PATCH == 0, imgs.shape
     assert keep.dtype == torch.bool and keep.shape == (N, h * w), (keep.dtype, keep.shape)
     assert not (store_cache and use_cache)
-    if background is None:
-        background = torch.zeros_like(keep)
-    assert background.shape == keep.shape and not (background & ~keep).any()
+    if query_indices is not None:
+        # Fixed-size CUDA Graph query boundary. Caller validates sorted unique
+        # in-range indices before copying into this persistent device buffer.
+        assert N == 1 and cam_only and use_cache and not store_cache
+        assert background is None and gates is None and groups is None
+        assert not config["mass"] and config["probe"] is None
+        assert query_indices.ndim == 1 and query_indices.dtype == torch.long
+        assert 0 < query_indices.numel() <= h * w
+        assert query_indices.device == imgs.device
+    else:
+        if background is None:
+            background = torch.zeros_like(keep)
+        assert background.shape == keep.shape and not (background & ~keep).any()
     if gates is not None:
         assert gates.shape == keep.shape and gates.dtype == torch.float32
         assert keep.all() and not store_cache and groups is None
@@ -166,17 +176,20 @@ def forward_kept(model, imgs, keep, cam_only=False, store_cache=False, use_cache
     assert not encoder.chunked_blocks
     start = 1 + encoder.num_register_tokens
     special = model.patch_start_idx
-    index = [row.nonzero()[:, 0] for row in keep]
-    stats["calls"] += 1
-    stats["kept"] += int(keep.sum())
-    stats["total"] += keep.numel()
-    stats["background"] += int(background.sum())
+    if query_indices is None:
+        index = [row.nonzero()[:, 0] for row in keep]
+        stats["calls"] += 1
+        stats["kept"] += int(keep.sum())
+        stats["total"] += keep.numel()
+        stats["background"] += int(background.sum())
+    else:
+        index = [query_indices]
 
     # Per-token labels, with the mass correction the additive log-weight of each
     # key, and for the probe the Chebyshev patch distance to the frame's object.
     probe = config["probe"]
     probing = probe is not None and probe.begin(store_cache, use_cache)
-    obj = keep & ~background
+    obj = keep & ~background if query_indices is None else None
     if probe is not None:
         grid_ij = torch.stack(torch.meshgrid(torch.arange(h, device=keep.device),
                                              torch.arange(w, device=keep.device), indexing="ij"),
@@ -184,7 +197,8 @@ def forward_kept(model, imgs, keep, cam_only=False, store_cache=False, use_cache
     labels, distances, biases = [], [], []
     dtype = torch.bfloat16 if torch.is_autocast_enabled() else torch.float32
     for n in range(N):
-        kept_bg = background[n][index[n]]
+        kept_bg = (background[n][index[n]] if query_indices is None else
+                   torch.zeros_like(index[n], dtype=torch.bool))
         labels.append(torch.cat([torch.full((special,), REGISTER, device=keep.device),
                                  torch.where(kept_bg, BACKGROUND, OBJECT)]))
         if probe is not None:
