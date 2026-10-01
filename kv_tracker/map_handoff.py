@@ -112,7 +112,7 @@ def bridge(old_points, new_points, old_conf, new_conf, old_pose, new_pose):
 
 class MapHandoff:
     def __init__(self, model, mode, log, save_bridge):
-        assert mode in ('native', 'fixed', 'handoff')
+        assert mode in ('native', 'fixed', 'handoff', 'oracle')
         self.model, self.mode, self.log, self.save_bridge = model, mode, log, save_bridge
         self.device = next(model.parameters()).device
         self.ids, self.images = [], []
@@ -126,6 +126,27 @@ class MapHandoff:
                    for layer in self.model.cache.values() for t in layer.values()}
         return sum(storage.values())
 
+    def query_geometry(self, image, frame):
+        """Read shared-view geometry without rebuilding or changing the bank."""
+        torch.cuda.synchronize()
+        started = time.perf_counter()
+        cache = [t for layer in self.model.cache.values() for t in layer.values()]
+        points, poses, conf, _, _, origin = pi3_inference(
+            self.model, [image[None]], self.device, use_cache=True)
+        assert origin is None  # Single-query outputs are still in raw cache coordinates.
+        assert all(a is b for a, b in zip(cache,
+            [t for layer in self.model.cache.values() for t in layer.values()], strict=True))
+        points = points[0, 0].double().cpu()
+        offset = self.origin.double().cpu()
+        points = points @ offset[:3, :3].T + offset[:3, 3]
+        scale, rotation, translation = self.transform
+        torch.cuda.synchronize()
+        self.log(dict(kind='shared_geometry', frame=frame, input_images=1,
+                      seconds=time.perf_counter() - started, cache_bytes=self.cache_bytes()))
+        return (scale * (points @ rotation.T) + translation,
+                transform_pose((self.origin @ poses)[0, 0].cpu(), self.transform),
+                conf[0, 0, ..., 0].cpu())
+
     def reconstruct(self, images, ids, frame, kind):
         torch.cuda.synchronize()
         started = time.perf_counter()
@@ -138,6 +159,10 @@ class MapHandoff:
         torch.cuda.synchronize()
         self.log(dict(kind=kind, frame=frame, input_ids=list(ids), input_images=len(images),
                       seconds=time.perf_counter() - started, cache_bytes=self.cache_bytes()))
+        if self.mode == 'oracle' and kind == 'rebuild':
+            self.anchor_points = points[0, 0].cpu().clone()
+            self.anchor_conf = conf[0, 0, ..., 0].cpu().clone()
+            self.bank_last_pose = poses[0, -1].cpu().clone()
         return points[0].cpu(), poses[0].cpu(), conf[0, ..., 0].cpu(), origin
 
     def bootstrap(self, image):
@@ -156,7 +181,8 @@ class MapHandoff:
         torch.cuda.synchronize()
         self.log(dict(kind='query', frame=frame, bank_ids=list(self.ids), input_images=1,
                       seconds=time.perf_counter() - started, cache_bytes=self.cache_bytes()))
-        if (frame + 1) % 50 or (self.mode == 'native' and len(self.ids) >= 20):
+        if (self.mode == 'oracle' and frame != 49) or (frame + 1) % 50 or (
+                self.mode == 'native' and len(self.ids) >= 20):
             return global_pose
         started = time.perf_counter()
         if self.mode == 'handoff' and frame == 749:
