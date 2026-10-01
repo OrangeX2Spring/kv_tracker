@@ -18,9 +18,17 @@ def sensitivity(q, k, v, protected):
     return float((full - floor).square().mean() / full.square().mean().clamp_min(1e-12))
 
 
+def budget_quotas(total, rooms, weights):
+    """Charge a small observation reserve before sensitivity-driven allocation."""
+    reserve = [min(8, room) for room in rooms]
+    assert total >= sum(reserve)
+    extra = allocate(total - sum(reserve), [r - n for r, n in zip(rooms, reserve)], weights)
+    return (extra + torch.tensor(reserve)).tolist()
+
+
 class OnlineLayerCache:
     def __init__(self, frame_equivalents, policy='online', probe_interval=16, queries=8):
-        assert frame_equivalents >= 2 and policy in ('online', 'uniform')
+        assert frame_equivalents >= 3 and policy in ('online', 'uniform')
         self.capacity, self.policy = frame_equivalents, policy
         self.interval, self.queries = probe_interval, queries
         assert self.interval > 0 and self.queries > 0
@@ -34,7 +42,7 @@ class OnlineLayerCache:
     def attach(self, model):
         self.model = model
         self.layers = list(range(1, len(model.decoder), 2))
-        self.scores = {i: 1. for i in self.layers}
+        self.scores = {i: 0. for i in self.layers}
         for i in self.layers:
             block = model.decoder[i]
             self.hooks.append(block.register_forward_pre_hook(partial(self.before, i), with_kwargs=True))
@@ -99,7 +107,7 @@ class OnlineLayerCache:
         optional = len(ids) - floor
         weights = ([self.scores[i] ** .5 for i in self.layers] if self.policy == 'online'
                    else [1.] * len(self.layers))
-        quotas = allocate(total - floor * len(self.layers), [optional] * len(self.layers), weights).tolist()
+        quotas = budget_quotas(total - floor * len(self.layers), [optional] * len(self.layers), weights)
         counts = {}
         for layer, quota in zip(self.layers, quotas):
             free = (~protected).nonzero().flatten()
