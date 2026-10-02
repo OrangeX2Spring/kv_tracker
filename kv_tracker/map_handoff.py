@@ -112,7 +112,9 @@ def bridge(old_points, new_points, old_conf, new_conf, old_pose, new_pose):
 
 class MapHandoff:
     def __init__(self, model, mode, log, save_bridge):
-        assert mode in ('native', 'fixed', 'handoff', 'oracle')
+        # 'reanchor' rebuilds like 'fixed' (anchor + latest) and keeps the first
+        # rebuild's anchor geometry for the inter-map connection.
+        assert mode in ('native', 'fixed', 'handoff', 'oracle', 'reanchor')
         self.model, self.mode, self.log, self.save_bridge = model, mode, log, save_bridge
         self.device = next(model.parameters()).device
         self.ids, self.images = [], []
@@ -159,7 +161,7 @@ class MapHandoff:
         torch.cuda.synchronize()
         self.log(dict(kind=kind, frame=frame, input_ids=list(ids), input_images=len(images),
                       seconds=time.perf_counter() - started, cache_bytes=self.cache_bytes()))
-        if self.mode == 'oracle' and kind == 'rebuild':
+        if kind == 'rebuild' and (self.mode == 'oracle' or (self.mode == 'reanchor' and frame == 49)):
             self.anchor_points = points[0, 0].cpu().clone()
             self.anchor_conf = conf[0, 0, ..., 0].cpu().clone()
             self.anchor_pose = poses[0, 0].cpu().clone()
