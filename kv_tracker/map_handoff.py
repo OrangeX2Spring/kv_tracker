@@ -113,7 +113,9 @@ def bridge(old_points, new_points, old_conf, new_conf, old_pose, new_pose):
 class MapHandoff:
     def __init__(self, model, mode, log, save_bridge):
         # 'reanchor' rebuilds like 'fixed' (anchor + latest) and keeps the first
-        # rebuild's anchor geometry for the inter-map connection.
+        # rebuild's anchor geometry for the inter-map connection. Each later rebuild
+        # re-normalizes Pi3's scale about the anchor camera; rebuild_scale restores
+        # the first rebuild's scale from the anchor pointmap every rebuild shares.
         assert mode in ('native', 'fixed', 'handoff', 'oracle', 'reanchor')
         self.model, self.mode, self.log, self.save_bridge = model, mode, log, save_bridge
         self.device = next(model.parameters()).device
@@ -122,6 +124,7 @@ class MapHandoff:
         self.transform = (torch.tensor(1., dtype=torch.float64), torch.eye(3, dtype=torch.float64),
                           torch.zeros(3, dtype=torch.float64))
         self.latest_points = self.latest_conf = None
+        self.rebuild_scale = 1.
 
     def cache_bytes(self):
         storage = {t.untyped_storage().data_ptr(): t.untyped_storage().nbytes()
@@ -141,12 +144,16 @@ class MapHandoff:
         points = points[0, 0].double().cpu()
         offset = self.origin.double().cpu()
         points = points @ offset[:3, :3].T + offset[:3, 3]
+        pose = (self.origin @ poses)[0, 0].cpu()
+        if self.mode == 'reanchor':
+            points = self.rebuild_scale * points
+            pose[:3, 3] *= self.rebuild_scale
         scale, rotation, translation = self.transform
         torch.cuda.synchronize()
         self.log(dict(kind='shared_geometry', frame=frame, input_images=1,
                       seconds=time.perf_counter() - started, cache_bytes=self.cache_bytes()))
         return (scale * (points @ rotation.T) + translation,
-                transform_pose((self.origin @ poses)[0, 0].cpu(), self.transform),
+                transform_pose(pose, self.transform),
                 conf[0, 0, ..., 0].cpu())
 
     def reconstruct(self, images, ids, frame, kind):
@@ -180,6 +187,8 @@ class MapHandoff:
         started = time.perf_counter()
         raw = pi3_inference(self.model, [image[None]], self.device, cam_only=True, use_cache=True)
         local_pose = (self.origin @ raw)[0, 0].cpu()
+        if self.mode == 'reanchor':
+            local_pose[:3, 3] *= self.rebuild_scale
         global_pose = transform_pose(local_pose, self.transform).float().numpy()
         torch.cuda.synchronize()
         self.log(dict(kind='query', frame=frame, bank_ids=list(self.ids), input_images=1,
@@ -235,11 +244,18 @@ class MapHandoff:
         else:
             ids, images = [self.ids[0], frame], [self.images[0], image]
         points, poses, conf, self.origin = self.reconstruct(images, ids, frame, 'rebuild')
+        if self.mode == 'reanchor' and frame != 49:
+            # Both pointmaps are in the anchor camera's frame; only scale differs.
+            valid = (conf[0] >= conf[0].median()) & (self.anchor_conf >= self.anchor_conf.median())
+            self.rebuild_scale = float((self.anchor_points.double()[valid].norm(dim=-1) /
+                                        points[0].double()[valid].norm(dim=-1)).median())
+            assert np.isfinite(self.rebuild_scale) and self.rebuild_scale > 0
         self.ids, self.images = ids, images
         self.latest_points, self.latest_conf = points[-1].clone(), conf[-1].clone()
         if self.events and self.events[-1]['frame'] == frame:
             self.events[-1]['retained_ids'] = list(self.ids)
         torch.cuda.synchronize()
         self.log(dict(kind='update_total', frame=frame, seconds=time.perf_counter()-started,
-                      cache_bytes=self.cache_bytes(), bank_ids=list(self.ids)))
+                      cache_bytes=self.cache_bytes(), bank_ids=list(self.ids),
+                      rebuild_scale=self.rebuild_scale))
         return global_pose
