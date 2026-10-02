@@ -162,6 +162,7 @@ class MapHandoff:
         if self.mode == 'oracle' and kind == 'rebuild':
             self.anchor_points = points[0, 0].cpu().clone()
             self.anchor_conf = conf[0, 0, ..., 0].cpu().clone()
+            self.anchor_pose = poses[0, 0].cpu().clone()
             self.bank_last_pose = poses[0, -1].cpu().clone()
         return points[0].cpu(), poses[0].cpu(), conf[0, ..., 0].cpu(), origin
 
