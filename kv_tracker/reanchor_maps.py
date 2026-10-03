@@ -14,8 +14,9 @@ from .map_handoff import MapHandoff, bridge, compose
 
 
 class ReanchorMaps:
-    def __init__(self, model, boundaries, log, save_bridge):
+    def __init__(self, model, boundaries, log, save_bridge, query_executor=None):
         self.model, self.boundaries = model, boundaries
+        self.query_executor = query_executor
         self.log, self.save_bridge = log, save_bridge
         self.start = 0
         self.tracker = self.new_map(0)
@@ -29,7 +30,7 @@ class ReanchorMaps:
         return MapHandoff(self.model, 'reanchor',
             lambda row: self.log(dict(row, segment_start=start,
                                       global_frame=start + row['frame'])),
-            self.save_bridge)
+            self.save_bridge, query_executor=self.query_executor)
 
     def step(self, image, frame):
         if frame == 0:
@@ -38,10 +39,13 @@ class ReanchorMaps:
             assert self.pending is None
             old = self.tracker
             # The retiring bank must not rebuild between camera and geometry reads.
-            old_pose = torch.from_numpy(old.step(image, frame - self.start, update=False)).double()
+            old_pose = torch.from_numpy(old.step(image, frame - self.start,
+                                                 update=False, dense_query=True)).double()
             points, pose, conf = old.query_geometry(image, frame - self.start)
             torch.testing.assert_close(pose, old_pose, atol=1e-5, rtol=1e-4)
             old_ids = [self.start + i for i in old.ids]
+            if self.query_executor is not None:
+                self.query_executor.reset()
             refs = [weakref.ref(t) for layer in self.model.cache.values() for t in layer.values()]
             image_refs = [weakref.ref(x) for x in old.images]
             # Delete all previous content before the new map exists.

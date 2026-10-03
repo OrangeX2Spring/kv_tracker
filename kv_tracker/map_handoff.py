@@ -111,13 +111,14 @@ def bridge(old_points, new_points, old_conf, new_conf, old_pose, new_pose):
 
 
 class MapHandoff:
-    def __init__(self, model, mode, log, save_bridge):
+    def __init__(self, model, mode, log, save_bridge, query_executor=None):
         # 'reanchor' rebuilds like 'fixed' (anchor + latest) and keeps the first
         # rebuild's anchor geometry for the inter-map connection. Each later rebuild
         # re-normalizes Pi3's scale about the anchor camera; rebuild_scale restores
         # the first rebuild's scale from the anchor pointmap every rebuild shares.
         assert mode in ('native', 'fixed', 'handoff', 'oracle', 'reanchor')
         self.model, self.mode, self.log, self.save_bridge = model, mode, log, save_bridge
+        self.query_executor = query_executor
         self.device = next(model.parameters()).device
         self.ids, self.images = [], []
         self.events = []
@@ -157,6 +158,8 @@ class MapHandoff:
                 conf[0, 0, ..., 0].cpu())
 
     def reconstruct(self, images, ids, frame, kind):
+        if self.query_executor is not None:
+            self.query_executor.reset()
         torch.cuda.synchronize()
         started = time.perf_counter()
         points, poses, conf, _, _, origin = pi3_inference(
@@ -182,10 +185,12 @@ class MapHandoff:
         self.latest_points, self.latest_conf = points[-1].clone(), conf[-1].clone()
         return transform_pose(poses[0], self.transform).float().numpy()
 
-    def step(self, image, frame, update=True):
+    def step(self, image, frame, update=True, dense_query=False):
         torch.cuda.synchronize()
         started = time.perf_counter()
-        raw = pi3_inference(self.model, [image[None]], self.device, cam_only=True, use_cache=True)
+        raw = (pi3_inference(self.model, [image[None]], self.device, cam_only=True, use_cache=True)
+               if self.query_executor is None or dense_query else
+               self.query_executor.forward(self.model, image, self.device))
         local_pose = (self.origin @ raw)[0, 0].cpu()
         if self.mode == 'reanchor':
             local_pose[:3, 3] *= self.rebuild_scale
