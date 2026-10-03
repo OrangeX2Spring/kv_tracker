@@ -23,6 +23,7 @@ class GraphQueries:
         # Release the graph and its cache references before the tracker rebuilds.
         self.graph = None
         self.image = self.index = self.features = None
+        self.positions = None
 
     def _query(self, model, imgs, keep, query_indices=None, defer_camera_head=False):
         if not self.native_dense:
@@ -38,8 +39,25 @@ class GraphQueries:
         hidden = model.encoder(normalized.reshape(B * N, C, H, W), is_training=True)
         if isinstance(hidden, dict):
             hidden = hidden['x_norm_patchtokens']
-        hidden, pos, mask = model.decode(hidden, N, H, W, use_cache=True)
-        camera = model.camera_decoder(hidden, xpos=pos, attn_mask=mask)
+        # Mirror native decode for B=N=1 without its CPU zeros -> CUDA copy.
+        # Fixed positions are prepared once outside graph capture.
+        assert B == N == 1
+        hidden = hidden.reshape(B * N, hidden.shape[1], -1)
+        register = model.register_token.repeat(B, N, 1, 1).reshape(
+            B * N, *model.register_token.shape[-2:])
+        hidden = torch.cat([register, hidden], dim=1)
+        pos = self.positions
+        final = []
+        for i, block in enumerate(model.decoder):
+            if i % 2:
+                hidden = block(hidden, xpos=pos, attn_mask=None,
+                               kv_cache=model.cache[i], ret_kv=False)
+            else:
+                hidden = block(hidden, xpos=pos, attn_mask=None)
+            if i + 1 in (len(model.decoder) - 1, len(model.decoder)):
+                final.append(hidden.reshape(B * N, hidden.shape[1], -1))
+        hidden = torch.cat(final, dim=-1)
+        camera = model.camera_decoder(hidden, xpos=pos, attn_mask=None)
         return dict(camera_features=camera.float()[:, model.patch_start_idx:])
 
     def forward(self, model, imgs, keep):
@@ -52,6 +70,12 @@ class GraphQueries:
         pointers = {i: {k: v.data_ptr() for k, v in layer.items()}
                     for i, layer in model.cache.items()}
         if self.graph is None:
+            if self.native_dense:
+                grid = model.position_getter(1, height // model.patch_size,
+                                             width // model.patch_size, imgs.device)
+                special = torch.zeros(1, model.patch_start_idx, 2,
+                                      device=imgs.device, dtype=grid.dtype)
+                self.positions = torch.cat([special, grid + 1], dim=1)
             torch.cuda.synchronize()
             started = time.perf_counter()
             expected = self._query(model, imgs, keep)['camera_poses'].clone()
