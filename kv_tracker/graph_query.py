@@ -18,12 +18,14 @@ class GraphQueries:
         self.rows = []
         self.queries = 0
         self.max_pose_error = 0.
+        self.replay_stages = {}
 
     def reset(self):
         # Release the graph and its cache references before the tracker rebuilds.
         self.graph = None
         self.image = self.index = self.features = None
         self.positions = None
+        self.replay_stages = {}
 
     def _query(self, model, imgs, keep, query_indices=None, defer_camera_head=False):
         if not self.native_dense:
@@ -39,6 +41,8 @@ class GraphQueries:
         hidden = model.encoder(normalized.reshape(B * N, C, H, W), is_training=True)
         if isinstance(hidden, dict):
             hidden = hidden['x_norm_patchtokens']
+        if self.checked:
+            self.replay_stages['encoder'] = hidden
         # Mirror native decode for B=N=1 without its CPU zeros -> CUDA copy.
         # Fixed positions are prepared once outside graph capture.
         assert B == N == 1
@@ -57,7 +61,11 @@ class GraphQueries:
             if i + 1 in (len(model.decoder) - 1, len(model.decoder)):
                 final.append(hidden.reshape(B * N, hidden.shape[1], -1))
         hidden = torch.cat(final, dim=-1)
+        if self.checked:
+            self.replay_stages['decoder'] = hidden
         camera = model.camera_decoder(hidden, xpos=pos, attn_mask=None)
+        if self.checked:
+            self.replay_stages['camera_decoder'] = camera
         return dict(camera_features=camera.float()[:, model.patch_start_idx:])
 
     def forward(self, model, imgs, keep):
@@ -108,7 +116,11 @@ class GraphQueries:
                     pose = model.camera_head(features, height // 14, width // 14).reshape(1, 1, 4, 4)
                 torch.testing.assert_close(pose, expected, rtol=1e-4, atol=1e-4)
                 self.graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(self.graph, stream=stream):
+                # Capture casts inside the graph, rather than borrowing BF16
+                # weight casts cached by the surrounding eager autocast context.
+                with torch.amp.autocast('cuda', dtype=torch.get_autocast_dtype('cuda'),
+                        enabled=torch.is_autocast_enabled('cuda'), cache_enabled=False), \
+                        torch.cuda.graph(self.graph, stream=stream):
                     self.features = self._query(model, self.image, self.keep,
                         query_indices=self.index,
                         defer_camera_head=True)['camera_features']
@@ -130,6 +142,9 @@ class GraphQueries:
         self.image.copy_(imgs)
         self.index.copy_(index)
         self.graph.replay()
+        if self.checked:
+            for stage, tensor in self.replay_stages.items():
+                assert torch.isfinite(tensor).all(), f'Non-finite graph replay at {stage}'
         with torch.amp.autocast('cuda', enabled=False):
             pose = model.camera_head(self.features, height // 14, width // 14).reshape(1, 1, 4, 4)
         if expected is not None:
