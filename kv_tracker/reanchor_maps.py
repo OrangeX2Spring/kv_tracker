@@ -37,7 +37,8 @@ class ReanchorMaps:
         if frame in self.boundaries[1:-1]:
             assert self.pending is None
             old = self.tracker
-            old_pose = torch.from_numpy(old.step(image, frame - self.start)).double()
+            # The retiring bank must not rebuild between camera and geometry reads.
+            old_pose = torch.from_numpy(old.step(image, frame - self.start, update=False)).double()
             points, pose, conf = old.query_geometry(image, frame - self.start)
             torch.testing.assert_close(pose, old_pose, atol=1e-5, rtol=1e-4)
             old_ids = [self.start + i for i in old.ids]
@@ -58,6 +59,23 @@ class ReanchorMaps:
         pose = self.tracker.step(image, local)
         if local != 49 or self.pending is None:
             return pose
+        self.connect(frame)
+        return pose
+
+    def finish(self, image, frame):
+        """Connect an unfinished final map at EOF, without dropping its poses."""
+        if self.pending is None:
+            return
+        local = frame - self.start
+        assert 0 <= local < 49
+        images, ids = [self.tracker.images[0], image], [0, local]
+        points, _, conf, self.tracker.origin = self.tracker.reconstruct(
+            images, ids, local, 'rebuild')
+        self.tracker.images, self.tracker.ids = images, ids
+        self.tracker.anchor_points, self.tracker.anchor_conf = points[0], conf[0]
+        self.connect(frame)
+
+    def connect(self, frame):
         pending, self.pending = self.pending, None
         scale, rotation, translation = self.tracker.transform
         new_points = scale * (self.tracker.anchor_points.double() @ rotation.T) + translation
@@ -72,11 +90,11 @@ class ReanchorMaps:
         anchored = (s, r, old[:3, 3] - s * (r @ new[:3, 3]))
         self.world = compose(self.world, anchored)
         self.transforms.append(self.world)
-        event.update(boundary=self.start, decision_frame=frame, delay_frames=49,
+        event.update(boundary=self.start, decision_frame=frame, delay_frames=frame - self.start,
+                     end_of_video=frame - self.start < 49,
                      old_ids=pending['old_ids'], new_ids=[self.start + i for i in self.tracker.ids],
                      anchored_rotation=r.tolist(), anchored_translation=anchored[2].tolist(),
                      old_kv_released=True, old_images_released=True,
                      connection='pose-anchored at b, point-fit scale')
         self.save_bridge(event, evidence)
         self.events.append(event)
-        return pose

@@ -182,7 +182,7 @@ class MapHandoff:
         self.latest_points, self.latest_conf = points[-1].clone(), conf[-1].clone()
         return transform_pose(poses[0], self.transform).float().numpy()
 
-    def step(self, image, frame):
+    def step(self, image, frame, update=True):
         torch.cuda.synchronize()
         started = time.perf_counter()
         raw = pi3_inference(self.model, [image[None]], self.device, cam_only=True, use_cache=True)
@@ -193,7 +193,7 @@ class MapHandoff:
         torch.cuda.synchronize()
         self.log(dict(kind='query', frame=frame, bank_ids=list(self.ids), input_images=1,
                       seconds=time.perf_counter() - started, cache_bytes=self.cache_bytes()))
-        if (self.mode == 'oracle' and frame != 49) or (frame + 1) % 50 or (
+        if not update or (self.mode == 'oracle' and frame != 49) or (frame + 1) % 50 or (
                 self.mode == 'native' and len(self.ids) >= 20):
             return global_pose
         started = time.perf_counter()
