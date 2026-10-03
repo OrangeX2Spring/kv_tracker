@@ -12,7 +12,7 @@ class QueryAcceleration:
         self.executor = None
         if method in ('graph', 'half_graph'):
             from .graph_query import GraphQueries
-            self.executor = GraphQueries(build_dir, checked)
+            self.executor = GraphQueries(build_dir, checked, native_dense=method == 'graph')
         self.keep = None
         self.queries = 0
         self.max_native_error = 0.
@@ -61,6 +61,7 @@ class QueryAcceleration:
 
     def summary(self):
         return dict(method=self.method, checked=self.checked, queries=self.queries,
+                    forward_path='native Pi3' if self.method == 'graph' else 'forward_kept',
                     max_native_error=self.max_native_error
                         if self.checked and self.method == 'graph' else None,
                     captures=self.executor.rows if self.executor is not None else [],
