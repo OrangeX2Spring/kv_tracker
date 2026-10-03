@@ -111,12 +111,15 @@ def bridge(old_points, new_points, old_conf, new_conf, old_pose, new_pose):
 
 
 class MapHandoff:
-    def __init__(self, model, mode, log, save_bridge, query_executor=None):
+    def __init__(self, model, mode, log, save_bridge, query_executor=None, native_keyframe_cap=20):
         # 'reanchor' rebuilds like 'fixed' (anchor + latest) and keeps the first
         # rebuild's anchor geometry for the inter-map connection. Each later rebuild
         # re-normalizes Pi3's scale about the anchor camera; rebuild_scale restores
         # the first rebuild's scale from the anchor pointmap every rebuild shares.
         assert mode in ('native', 'fixed', 'handoff', 'oracle', 'reanchor')
+        assert native_keyframe_cap >= 2
+        assert mode == 'native' or native_keyframe_cap == 20
+        self.native_keyframe_cap = native_keyframe_cap
         self.model, self.mode, self.log, self.save_bridge = model, mode, log, save_bridge
         self.query_executor = query_executor
         self.device = next(model.parameters()).device
@@ -199,7 +202,7 @@ class MapHandoff:
         self.log(dict(kind='query', frame=frame, bank_ids=list(self.ids), input_images=1,
                       seconds=time.perf_counter() - started, cache_bytes=self.cache_bytes()))
         if not update or (self.mode == 'oracle' and frame != 49) or (frame + 1) % 50 or (
-                self.mode == 'native' and len(self.ids) >= 20):
+                self.mode == 'native' and len(self.ids) >= self.native_keyframe_cap):
             return global_pose
         started = time.perf_counter()
         if self.mode == 'handoff' and frame == 749:
