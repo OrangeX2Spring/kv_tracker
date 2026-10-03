@@ -144,7 +144,8 @@ class Probe:
 
 def forward_kept(model, imgs, keep, cam_only=False, store_cache=False, use_cache=False,
                  background=None, gates=None, groups=None, query_indices=None,
-                 defer_camera_head=False):
+                 defer_camera_head=False, decoder_depth=None, reference_depth=None,
+                 guidance=0.):
     """Optional diagnostic gates act after the full encoder; groups map each
     original patch to a kept representative, merging after encoder block 15.
     Groups add log group-size bias in the decoder and replicate head features.
@@ -157,6 +158,17 @@ def forward_kept(model, imgs, keep, cam_only=False, store_cache=False, use_cache
     assert B == 1 and H % PATCH == 0 and W % PATCH == 0, imgs.shape
     assert keep.dtype == torch.bool and keep.shape == (N, h * w), (keep.dtype, keep.shape)
     assert not (store_cache and use_cache)
+    depth = len(model.decoder) if decoder_depth is None else decoder_depth
+    if decoder_depth is not None or reference_depth is not None or guidance:
+        # Layer-depth contrast is an untrained analogue, not recurrent LoopCD.
+        assert N == 1 and cam_only and use_cache and not store_cache
+        assert gates is None and groups is None and query_indices is None
+        assert keep.all() and background is None
+        assert 2 <= depth <= len(model.decoder) and depth % 2 == 0
+        assert guidance >= 0
+        assert (reference_depth is not None) == (guidance > 0)
+        if reference_depth is not None:
+            assert 2 <= reference_depth < depth and reference_depth % 2 == 0
     assert not defer_camera_head or query_indices is not None
     if query_indices is not None:
         # Fixed-size CUDA Graph query boundary. Caller validates sorted unique
@@ -266,8 +278,8 @@ def forward_kept(model, imgs, keep, cam_only=False, store_cache=False, use_cache
         key_labels, key_distance, key_bias = joint_labels, joint_distance, joint_bias
     if store_cache:
         model.kept_cache = dict(labels=joint_labels, distance=joint_distance, bias=joint_bias)
-    last = []
-    for i, blk in enumerate(model.decoder):
+    last, reference = [], []
+    for i, blk in enumerate(model.decoder[:depth]):
         if i % 2 == 0:
             hidden = [(checkpoint(blk, x, xpos=p, attn_mask=b, use_reentrant=False)
                        if gates is not None else blk(x, xpos=p, attn_mask=b))
@@ -290,9 +302,15 @@ def forward_kept(model, imgs, keep, cam_only=False, store_cache=False, use_cache
                 x = (checkpoint(blk, x, xpos=p, attn_mask=key_bias, use_reentrant=False)
                      if gates is not None else blk(x, xpos=p, attn_mask=key_bias))
             hidden = list(torch.split(x, lengths, dim=1))
-        if i + 1 >= len(model.decoder) - 1:
+        if reference_depth is not None and i + 1 in (reference_depth - 1, reference_depth):
+            reference.append(hidden)
+        if i + 1 >= depth - 1:
             last.append(hidden)
     hidden = [torch.cat([a, b], dim=-1) for a, b in zip(*last)]
+    if reference_depth is not None:
+        weak = [torch.cat([a, b], dim=-1) for a, b in zip(*reference)]
+        hidden = [(strong.float() + guidance * (strong.float() - early.float())).to(strong.dtype)
+                  for strong, early in zip(hidden, weak)]
 
     poses = []
     for x, p, b in zip(hidden, pos, mass):
