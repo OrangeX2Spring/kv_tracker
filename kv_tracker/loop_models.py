@@ -317,10 +317,10 @@ class LoopedPi3(Pi3):
         elif global_block and store:
             # Shared cache is generated once; later recurrences consume that bank
             # on queries, but must not duplicate it inside the joint rebuild.
+            # A grad-enabled training rebuild keeps the bank in the query's graph.
             result, k, v = blk(x, xpos=pos, ret_kv=True)
             if key not in self.cache:
-                self.cache[key] = dict(k=k.detach().contiguous().clone(),
-                                       v=v.detach().contiguous().clone())
+                self.cache[key] = dict(k=k.contiguous().clone(), v=v.contiguous().clone())
         else:
             def apply(value):
                 return blk(value, xpos=pos, kv_cache=historical, ret_kv=False)
@@ -450,7 +450,8 @@ class LoopedPi3(Pi3):
             pose = self.refiner(encoded, self.memory_features, self.memory_points,
                                 start_pose, self.map_scale, self.config.refiner_steps)
             self.refiner_previous = self.refiner_state
-            self.refiner_state = pose.detach()
+            # Grad-enabled training replays backpropagate through the rollout.
+            self.refiner_state = pose
             self.last_execution = dict(refiner_steps=self.config.refiner_steps,
                                        map_tokens=self.memory_points.shape[0])
             return dict(camera_poses=pose.reshape(1, 1, 4, 4))
