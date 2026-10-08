@@ -30,6 +30,7 @@ class LoopConfig:
     refiner_dim: int = 256
     refiner_steps: int = 3
     map_tokens_per_frame: int = 64
+    recovery: bool = False
 
     def __post_init__(self):
         assert self.variant in VARIANTS + ('native', 'native_compact')
@@ -38,6 +39,8 @@ class LoopConfig:
         assert self.rank > 0 and 0 < self.active_fraction <= 1
         assert self.refiner_dim % 8 == 0 and self.refiner_steps > 0
         assert self.map_tokens_per_frame > 0
+        if self.recovery:
+            assert self.variant == 'relaxed' and self.core_pairs == 8 and self.full_loops == 2
 
 
 class _TrainingRoPEFunction(torch.autograd.Function):
@@ -212,6 +215,9 @@ class LoopedPi3(Pi3):
         self.exit_records = []
         self.last_features = self.routing_features = self.routing_scores = None
         self.exit_features = {}
+        self.loop_features = {}
+        self.teacher_states = None
+        self.teacher_mix = 0.
         self.last_execution = {}
         self.register_buffer('halt_thresholds', torch.full((3,), -1., device=native.image_mean.device))
         if config.variant in ('refiner', 'native', 'native_compact'):
@@ -258,6 +264,9 @@ class LoopedPi3(Pi3):
         self.condition = nn.Linear(2, native.dec_embed_dim).to(native.image_mean.device)
         nn.init.zeros_(self.condition.weight)
         nn.init.zeros_(self.condition.bias)
+        if config.recovery:
+            # Depth-specific adapters already encode depth in the recovery model.
+            self.condition.requires_grad_(False)
         self.router = nn.Sequential(nn.LayerNorm(native.dec_embed_dim),
                                     nn.Linear(native.dec_embed_dim, 1)).to(native.image_mean.device)
         self.router.requires_grad_(config.variant == 'token')
@@ -282,6 +291,9 @@ class LoopedPi3(Pi3):
         if not mode:
             self.last_features = self.routing_features = self.routing_scores = None
             self.exit_features = {}
+            self.loop_features = {}
+            self.teacher_states = None
+            self.teacher_mix = 0.
         return self
 
     def encode(self, imgs):
@@ -379,11 +391,17 @@ class LoopedPi3(Pi3):
         schedule = [(step + 1) * self.config.full_loops // loops - 1 for step in range(loops)]
         self.exit_records = []
         self.exit_features = {}
+        self.loop_features = {}
         self.routing_features = self.routing_scores = None
         self.last_execution = dict(loops=0, local_blocks=0, global_blocks=0, active_rows=[],
                                    halted=False, cache_slots=0)
         previous_pose = None
         for step, r in enumerate(schedule):
+            if self.teacher_states is not None:
+                assert self.training and self.config.recovery and 0 <= self.teacher_mix <= 1
+                target = self.teacher_states[1 + 2 * self.config.core_pairs * r].to(x)
+                assert target.numel() == x.numel()
+                x = torch.lerp(x, target.reshape_as(x), self.teacher_mix)
             t = x.new_tensor([step / loops, 1 / loops])
             rows = None
             if self.config.variant == 'token' and use_cache and step > 0:
@@ -409,6 +427,8 @@ class LoopedPi3(Pi3):
                     self.last_execution['global_blocks'] += 1
                 x = x.reshape(N, length, -1)
             self.last_execution['loops'] += 1
+            if self.training and self.config.recovery:
+                self.loop_features[1 + 2 * self.config.core_pairs * (r + 1)] = x
             if (adaptive and self.training
                     and self.config.short_loops <= step + 1 < self.config.full_loops):
                 self.exit_features[step + 1] = self.end_pair(x, pos, N, H, W, use=True)
@@ -463,10 +483,11 @@ class LoopedPi3(Pi3):
                           for slot, row in self.cache.items()}
         if store_cache and self.config.variant not in ('native', 'native_compact'):
             assert not cam_only
-            points = output['points'][0, :, 7::14, 7::14].reshape(-1, 3).detach()
+            # The normalized training objective depends on this scale too.
+            points = output['points'][0, :, 7::14, 7::14].reshape(-1, 3).float()
             self.map_scale = (points - points.mean(0)).norm(dim=-1).median().clamp_min(1e-6)
             if self.config.variant == 'adaptive':
-                self.map_points = points.clone()
+                self.map_points = points.detach().clone()
                 self.map_confidence = output['conf'][0, :, 7::14, 7::14, 0].sigmoid().flatten().detach().clone()
             if self.config.variant == 'refiner':
                 cells = self.encoded_bank.shape[1]
