@@ -9,6 +9,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from pi3.models.pi3 import Pi3
 
@@ -32,7 +33,7 @@ class LoopConfig:
     def __post_init__(self):
         assert self.variant in VARIANTS + ('native', 'native_compact')
         assert 2 * self.core_pairs * self.full_loops + 4 == 36
-        assert self.full_loops % self.short_loops == 0 and self.short_loops > 0
+        assert self.short_loops > 0 and self.full_loops % self.short_loops == 0
         assert self.rank > 0 and 0 < self.active_fraction <= 1
         assert self.refiner_dim % 8 == 0 and self.refiner_steps > 0
         assert self.map_tokens_per_frame > 0
@@ -90,7 +91,11 @@ def selected_block(blk, x, pos, rows, cache=None):
     q, k = attn.rope(q, pos[:, rows]), attn.rope(k, pos)
     if cache is not None:
         k, v = torch.cat((cache['k'], k), 2), torch.cat((cache['v'], v), 2)
-    update = F.scaled_dot_product_attention(q, k, v).transpose(1, 2).reshape(1, len(rows), width)
+    # Match native FlashAttentionRope's backend policy for both tested dtypes.
+    backend = (SDPBackend.FLASH_ATTENTION if q.dtype == torch.bfloat16
+               else [SDPBackend.MATH, SDPBackend.EFFICIENT_ATTENTION])
+    with sdpa_kernel(backend):
+        update = F.scaled_dot_product_attention(q, k, v).transpose(1, 2).reshape(1, len(rows), width)
     current = x[:, rows] + blk.ls1(attn.proj_drop(attn.proj(update)))
     current = current + blk.ls2(blk.mlp(blk.norm2(current)))
     return x.index_copy(1, rows, current)
@@ -178,7 +183,7 @@ class LoopedPi3(Pi3):
         self.geometry_calibration = None
         self.exit_records = []
         self.last_features = self.routing_features = self.routing_scores = None
-        self.short_features = None
+        self.exit_features = {}
         self.last_execution = {}
         self.register_buffer('halt_thresholds', torch.full((3,), -1., device=native.image_mean.device))
         if config.variant in ('refiner', 'native', 'native_compact'):
@@ -237,7 +242,8 @@ class LoopedPi3(Pi3):
         self.point_decoder.eval()
         self.conf_decoder.eval()
         if not mode:
-            self.last_features = self.short_features = self.routing_features = self.routing_scores = None
+            self.last_features = self.routing_features = self.routing_scores = None
+            self.exit_features = {}
         return self
 
     def encode(self, imgs):
@@ -334,7 +340,7 @@ class LoopedPi3(Pi3):
             loops = self.config.full_loops
         schedule = [(step + 1) * self.config.full_loops // loops - 1 for step in range(loops)]
         self.exit_records = []
-        self.short_features = None
+        self.exit_features = {}
         self.routing_features = self.routing_scores = None
         self.last_execution = dict(loops=0, local_blocks=0, global_blocks=0, active_rows=[],
                                    halted=False, cache_slots=0)
@@ -353,10 +359,10 @@ class LoopedPi3(Pi3):
             delta = self.condition(t).to(x.dtype)
             x = (x + delta if rows is None else
                  x.index_add(1, rows, delta.reshape(1, 1, -1).expand(1, len(rows), -1)))
+            blocks = (self.depth_blocks if self.depth_blocks else self.core)
+            offset = r * len(self.core) if self.depth_blocks else 0
             for pair in range(self.config.core_pairs):
-                slot = 2 * pair
-                blocks = (self.depth_blocks[r * len(self.core):(r + 1) * len(self.core)]
-                          if self.depth_blocks else self.core)
+                slot = offset + 2 * pair
                 x = self.block(blocks[slot], x, pos, False, 'unused', False, False, rows)
                 self.last_execution['local_blocks'] += 1
                 if self.config.variant != 'nested' or pair % 2 == 1:
@@ -365,13 +371,16 @@ class LoopedPi3(Pi3):
                     self.last_execution['global_blocks'] += 1
                 x = x.reshape(N, length, -1)
             self.last_execution['loops'] += 1
-            if adaptive and self.training and step + 1 == self.config.short_loops:
-                self.short_features = self.end_pair(x, pos, N, H, W, use=True)
-            if adaptive and (self.collect_exits or not self.training):
+            if (adaptive and self.training
+                    and self.config.short_loops <= step + 1 < self.config.full_loops):
+                self.exit_features[step + 1] = self.end_pair(x, pos, N, H, W, use=True)
+            if adaptive and step + 1 < loops and (self.collect_exits or not self.training):
                 assert N == 1 and self.geometry_calibration is not None
                 candidate = self.end_pair(x, pos, N, H, W, use=True)
                 pose = self.read_pose(candidate, pos, H, W).reshape(4, 4)
-                residual = self.geometry_residual(candidate, pos, pose, H, W)
+                residual = (self.geometry_residual(candidate, pos, pose, H, W)
+                            if step + 1 >= self.config.short_loops
+                            else pose.new_tensor(float('inf')))
                 change = (pose_distance(pose, previous_pose, self.map_scale)
                           if previous_pose is not None else pose.new_full((2,), float('inf')))
                 signals = torch.cat((change, residual[None]))
@@ -432,7 +441,8 @@ class LoopedPi3(Pi3):
                 self.refiner_previous = None
                 del self.encoded_bank
         if not self.training:
-            self.last_features = self.short_features = self.routing_features = self.routing_scores = None
+            self.last_features = self.routing_features = self.routing_scores = None
+            self.exit_features = {}
         return output
 
     def storage_report(self):
