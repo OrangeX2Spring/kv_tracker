@@ -12,6 +12,7 @@ from torch.utils.checkpoint import checkpoint
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from pi3.models.pi3 import Pi3
+from pi3.curope.curope2d import cuRoPE2D, curope_backend
 
 VARIANTS = ('elastic', 'relaxed', 'shared_kv', 'adaptive', 'token', 'refiner', 'nested', 'combined')
 PI3_SHA256 = 'cbcf68b3c05baab7680f6e24afda42501dc0ba799e85ca18668ba3e8a5812979'
@@ -37,6 +38,33 @@ class LoopConfig:
         assert self.rank > 0 and 0 < self.active_fraction <= 1
         assert self.refiner_dim % 8 == 0 and self.refiner_steps > 0
         assert self.map_tokens_per_frame > 0
+
+
+class _TrainingRoPEFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, tokens, positions, base, frequency):
+        ctx.save_for_backward(positions)
+        ctx.base, ctx.frequency = base, frequency
+        # The CUDA kernel mutates B,N,H,D storage; never alias its caller.
+        buffer = tokens.transpose(1, 2).clone(memory_format=torch.contiguous_format)
+        curope_backend.rope_2d(buffer, positions, base, frequency)
+        return buffer.transpose(1, 2).contiguous()
+
+    @staticmethod
+    def backward(ctx, gradient):
+        positions, = ctx.saved_tensors
+        # Clone even a contiguous gradient: other graph branches may share it.
+        buffer = gradient.transpose(1, 2).clone(memory_format=torch.contiguous_format)
+        curope_backend.rope_2d(buffer, positions, ctx.base, -ctx.frequency)
+        return buffer.transpose(1, 2).contiguous(), None, None, None
+
+
+class TrainingRoPE(cuRoPE2D):
+    """Native inference with an owned contiguous buffer for training backward."""
+    def forward(self, tokens, positions):
+        if torch.is_grad_enabled() and tokens.requires_grad:
+            return _TrainingRoPEFunction.apply(tokens, positions, self.base, self.F0)
+        return super().forward(tokens, positions)
 
 
 class LowRankLinear(nn.Module):
@@ -233,6 +261,16 @@ class LoopedPi3(Pi3):
         self.router = nn.Sequential(nn.LayerNorm(native.dec_embed_dim),
                                     nn.Linear(native.dec_embed_dim, 1)).to(native.image_mean.device)
         self.router.requires_grad_(config.variant == 'token')
+        # Frozen heads still backpropagate to decoder features. Copy module shells
+        # while sharing frozen tensors, so installing RoPE does not mutate native.
+        memo = {id(tensor): tensor for tensor in (*native.parameters(), *native.buffers())}
+        for name in ('camera_decoder', 'point_decoder', 'conf_decoder'):
+            setattr(self, name, deepcopy(getattr(self, name), memo))
+        for collection in (self.entry, self.exit, self.core, self.depth_blocks,
+                           self.camera_decoder, self.point_decoder, self.conf_decoder):
+            for module in collection.modules():
+                if isinstance(getattr(module, 'rope', None), cuRoPE2D):
+                    module.rope = TrainingRoPE(module.rope.base, module.rope.F0)
 
     def train(self, mode=True):
         super().train(mode)
