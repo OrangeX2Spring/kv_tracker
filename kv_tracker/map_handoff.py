@@ -111,7 +111,8 @@ def bridge(old_points, new_points, old_conf, new_conf, old_pose, new_pose):
 
 
 class MapHandoff:
-    def __init__(self, model, mode, log, save_bridge, query_executor=None, native_keyframe_cap=20):
+    def __init__(self, model, mode, log, save_bridge, query_executor=None, native_keyframe_cap=20,
+                 local_keyframe_cap=2):
         # 'reanchor' rebuilds like 'fixed' (anchor + latest) and keeps the first
         # rebuild's anchor geometry for the inter-map connection. Each later rebuild
         # re-normalizes Pi3's scale about the anchor camera; rebuild_scale restores
@@ -119,6 +120,9 @@ class MapHandoff:
         assert mode in ('native', 'fixed', 'handoff', 'oracle', 'reanchor')
         assert native_keyframe_cap >= 2
         assert mode == 'native' or native_keyframe_cap == 20
+        assert local_keyframe_cap in (2, 3)
+        assert mode == 'reanchor' or local_keyframe_cap == 2
+        self.local_keyframe_cap = local_keyframe_cap
         self.native_keyframe_cap = native_keyframe_cap
         self.model, self.mode, self.log, self.save_bridge = model, mode, log, save_bridge
         self.query_executor = query_executor
@@ -251,6 +255,9 @@ class MapHandoff:
             ids, images = self.ids + [frame], self.images + [image]
         else:
             ids, images = [self.ids[0], frame], [self.images[0], image]
+            if self.local_keyframe_cap == 3 and len(self.ids) > 1:
+                ids.insert(1, self.ids[-1])
+                images.insert(1, self.images[-1])
         points, poses, conf, self.origin = self.reconstruct(images, ids, frame, 'rebuild')
         if self.mode == 'reanchor' and frame != 49:
             # Both pointmaps are in the anchor camera's frame; only scale differs.

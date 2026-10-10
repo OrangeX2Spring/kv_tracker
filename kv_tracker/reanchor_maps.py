@@ -14,9 +14,11 @@ from .map_handoff import MapHandoff, bridge, compose
 
 
 class ReanchorMaps:
-    def __init__(self, model, boundaries, log, save_bridge, query_executor=None):
+    def __init__(self, model, boundaries, log, save_bridge, query_executor=None,
+                 local_keyframe_cap=2):
         self.model, self.boundaries = model, boundaries
         self.query_executor = query_executor
+        self.local_keyframe_cap = local_keyframe_cap
         self.log, self.save_bridge = log, save_bridge
         self.start = 0
         self.tracker = self.new_map(0)
@@ -30,7 +32,8 @@ class ReanchorMaps:
         return MapHandoff(self.model, 'reanchor',
             lambda row: self.log(dict(row, segment_start=start,
                                       global_frame=start + row['frame'])),
-            self.save_bridge, query_executor=self.query_executor)
+            self.save_bridge, query_executor=self.query_executor,
+            local_keyframe_cap=self.local_keyframe_cap)
 
     def step(self, image, frame):
         if frame == 0:
