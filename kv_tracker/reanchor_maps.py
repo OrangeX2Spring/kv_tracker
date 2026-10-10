@@ -12,6 +12,14 @@ The connection keeps rotation and position pinned at b but takes scale from the
 camera displacements of those shared frames in both maps, not from one pointmap;
 the point-fit scale is still computed and logged. Old KV and images are released
 at the connection instead of at b.
+
+two_way connects on two frames that each map actually covers: b (old map by query,
+new map by its first rebuild, as before) and the old map's latest keyframe L just
+before b (old map by its own rebuild, new map by one dense query at b+49 of a CPU
+copy of L's image). One robust, confidence-weighted Sim(3) over both frames' points
+supplies the scale (VGGT-Diff-style: weight by confidence, require the same points
+to agree across views); rotation and position stay pinned at b. The two frames use
+query-versus-rebuild in opposite directions. Per-frame scales are logged.
 """
 import weakref
 
@@ -20,10 +28,35 @@ import torch
 from .map_handoff import MapHandoff, bridge, compose
 
 
+def weighted_similarity(source, target, weight):
+    """Robust confidence-weighted Sim(3), source into target; float64 CPU points."""
+    assert source.ndim == 2 and source.shape == target.shape and source.shape[1] == 3
+    assert source.dtype == target.dtype == weight.dtype == torch.float64 and weight.shape == source.shape[:1]
+    keep = torch.isfinite(source).all(1) & torch.isfinite(target).all(1) & (weight > 0)
+    # Zero weight must not turn a non-finite point into NaN sums.
+    source, target = torch.where(keep[:, None], source, 0.), torch.where(keep[:, None], target, 0.)
+    extent = (target[keep] - target[keep].mean(0)).square().sum(1).mean().sqrt()
+    for step in range(4):
+        w = torch.where(keep, weight, 0.)
+        w = w / w.sum()
+        x_mean, y_mean = (w[:, None] * source).sum(0), (w[:, None] * target).sum(0)
+        x, y = source - x_mean, target - y_mean
+        u, d, vh = torch.linalg.svd((w[:, None] * y).T @ x)
+        sign = torch.ones(3, dtype=torch.float64)
+        sign[-1] = torch.linalg.det(u) * torch.linalg.det(vh)
+        rotation = (u * sign) @ vh
+        scale = (d * sign).sum() / (w * x.square().sum(1)).sum()
+        if step < 3:  # three rejection rounds, then the final fit on the kept points
+            residual = (scale * (x @ rotation.T) - y).norm(dim=1)
+            keep = keep & (residual <= max(float(3 * residual[keep].median()), float(.01 * extent)))
+    assert int(keep.sum()) >= 128 and scale > 0
+    return float(scale), keep
+
+
 class ReanchorMaps:
     def __init__(self, model, boundaries, log, save_bridge, query_executor=None,
                  local_keyframe_cap=2, pin_rebuilds=False, pin_scale=False, shared_scale=False,
-                 fuse_scale=False, novelty_refresh=None, overlap_stride=None):
+                 fuse_scale=False, novelty_refresh=None, overlap_stride=None, two_way=False):
         self.model, self.boundaries = model, boundaries
         self.query_executor = query_executor
         self.local_keyframe_cap = local_keyframe_cap
@@ -34,6 +67,8 @@ class ReanchorMaps:
         # Two maps share the model's single cache slot by swapping; no query executor.
         assert overlap_stride is None or (query_executor is None and not pin_rebuilds)
         self.overlap_stride = overlap_stride
+        assert not two_way or (overlap_stride is None and not pin_rebuilds)
+        self.two_way = two_way
         self.pin_rebuilds, self.pin_scale, self.shared_scale = pin_rebuilds, pin_scale, shared_scale
         self.fuse_scale, self.novelty_refresh = fuse_scale, novelty_refresh
         self.log, self.save_bridge = log, save_bridge
@@ -66,6 +101,13 @@ class ReanchorMaps:
             points, pose, conf = old.query_geometry(image, frame - self.start)
             torch.testing.assert_close(pose, old_pose, atol=1e-5, rtol=1e-4)
             old_ids = [self.start + i for i in old.ids]
+            latest = None
+            if self.two_way:
+                # L in the old map's output frame, from its own rebuild; image copied to CPU.
+                assert len(old.ids) >= 2
+                s0, r0, t0 = old.transform
+                latest = dict(frame=old_ids[-1], image=old.images[-1].copy(), conf=old.latest_conf.clone(),
+                              points=s0 * ((old.rebuild_scale * old.latest_points.double()) @ r0.T) + t0)
             if self.query_executor is not None:
                 self.query_executor.reset()
             overlap = None
@@ -85,7 +127,8 @@ class ReanchorMaps:
             self.tracker = self.new_map(frame)
             new_pose = self.tracker.bootstrap(image)
             self.pending = dict(old_pose=old_pose, points=points, conf=conf, old_ids=old_ids,
-                                new_pose=torch.from_numpy(new_pose).double(), overlap=overlap)
+                                new_pose=torch.from_numpy(new_pose).double(), overlap=overlap,
+                                latest=latest)
             if overlap is not None:
                 overlap['pairs'] = [(old_pose, self.pending['new_pose'])]
             return new_pose
@@ -147,6 +190,24 @@ class ReanchorMaps:
             pending['overlap'] = None
             assert all(ref() is None for ref in refs), 'Old KV tensor still referenced'
             assert all(ref() is None for ref in image_refs), 'Old image still referenced'
+        latest = pending['latest']
+        if latest is not None:
+            new_latest, _, new_latest_conf = self.tracker.query_geometry(latest['image'], frame - self.start)
+            frames = ((pending['points'], new_points, pending['conf'], self.tracker.anchor_conf),
+                      (latest['points'], new_latest, latest['conf'], new_latest_conf))
+            sources, targets, weights, per_frame = [], [], [], []
+            for old_points, frame_points, old_conf, new_conf in frames:
+                assert old_points.shape == frame_points.shape and old_conf.shape == new_conf.shape
+                # Same stride-4 pixel samples as bridge(); weight = joint confidence.
+                sampled = [t[::4, ::4].reshape(-1, *t.shape[2:]).double()
+                           for t in (frame_points, old_points, old_conf * new_conf)]
+                per_frame.append(weighted_similarity(*sampled)[0])
+                sources.append(sampled[0]), targets.append(sampled[1]), weights.append(sampled[2])
+            two_way_scale, keep = weighted_similarity(torch.cat(sources), torch.cat(targets), torch.cat(weights))
+            s = torch.tensor(two_way_scale, dtype=torch.float64)
+            event.update(point_fit_scale=event['scale'], two_way_scale=two_way_scale,
+                         frame_b_scale=per_frame[0], latest_frame=latest['frame'],
+                         latest_frame_scale=per_frame[1], two_way_inliers=int(keep.sum()))
         anchored = (s, r, old[:3, 3] - s * (r @ new[:3, 3]))
         self.world = compose(self.world, anchored)
         self.transforms.append(self.world)
@@ -156,6 +217,7 @@ class ReanchorMaps:
                      anchored_rotation=r.tolist(), anchored_translation=anchored[2].tolist(),
                      old_kv_released=True, old_images_released=True,
                      connection='pose-anchored at b, ' + ('overlap-displacement scale'
-                                if self.overlap_stride is not None else 'point-fit scale'))
+                                if self.overlap_stride is not None else 'two-way two-frame weighted scale'
+                                if self.two_way else 'point-fit scale'))
         self.save_bridge(event, evidence)
         self.events.append(event)
