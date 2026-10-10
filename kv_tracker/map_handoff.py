@@ -112,7 +112,7 @@ def bridge(old_points, new_points, old_conf, new_conf, old_pose, new_pose):
 
 class MapHandoff:
     def __init__(self, model, mode, log, save_bridge, query_executor=None, native_keyframe_cap=20,
-                 local_keyframe_cap=2, pin_rebuilds=False):
+                 local_keyframe_cap=2, pin_rebuilds=False, pin_scale=False):
         # 'reanchor' rebuilds like 'fixed' (anchor + latest) and keeps the first
         # rebuild's anchor geometry for the inter-map connection. Each later rebuild
         # re-normalizes Pi3's scale about the anchor camera; rebuild_scale restores
@@ -120,13 +120,17 @@ class MapHandoff:
         # pin_rebuilds additionally removes the rebuild's free rotation/translation
         # relative to the anchor: the new solution is rigidly moved so its pose of
         # the refresh frame equals the outgoing bank's pose of that frame.
+        # pin_scale also replaces the anchor-pointmap scale: rebuild_scale makes the
+        # new rebuild's depths of the refresh frame (in its own camera) match the
+        # outgoing bank's, read with one dense query before the bank changes.
         assert mode in ('native', 'fixed', 'handoff', 'oracle', 'reanchor')
         assert native_keyframe_cap >= 2
         assert mode == 'native' or native_keyframe_cap == 20
         assert local_keyframe_cap in (2, 3)
         assert mode == 'reanchor' or local_keyframe_cap == 2
         assert mode == 'reanchor' or not pin_rebuilds
-        self.pin_rebuilds = pin_rebuilds
+        assert pin_rebuilds or not pin_scale
+        self.pin_rebuilds, self.pin_scale = pin_rebuilds, pin_scale
         self.local_keyframe_cap = local_keyframe_cap
         self.native_keyframe_cap = native_keyframe_cap
         self.model, self.mode, self.log, self.save_bridge = model, mode, log, save_bridge
@@ -263,8 +267,20 @@ class MapHandoff:
             if self.local_keyframe_cap == 3 and len(self.ids) > 1:
                 ids.insert(1, self.ids[-1])
                 images.insert(1, self.images[-1])
+        if self.pin_scale:
+            old_points, old_pose, old_conf = self.query_geometry(image, frame)
+            # Camera-frame points of the refresh frame, in the outgoing bank's units.
+            old_camera = (old_points - old_pose[:3, 3]) @ old_pose[:3, :3] / self.transform[0]
         points, poses, conf, self.origin = self.reconstruct(images, ids, frame, 'rebuild')
-        if self.mode == 'reanchor' and frame != 49:
+        if self.pin_scale:
+            new_pose = poses[-1].double()
+            new_camera = (points[-1].double() - new_pose[:3, 3]) @ new_pose[:3, :3]
+            assert old_camera.shape == new_camera.shape and old_conf.shape == conf[-1].shape
+            valid = (old_conf >= old_conf.median()) & (conf[-1] >= conf[-1].median())
+            self.rebuild_scale = float((old_camera[valid].norm(dim=-1) /
+                                        new_camera[valid].norm(dim=-1)).median())
+            assert np.isfinite(self.rebuild_scale) and self.rebuild_scale > 0
+        elif self.mode == 'reanchor' and frame != 49:
             # Both pointmaps are in the anchor camera's frame; only scale differs.
             valid = (conf[0] >= conf[0].median()) & (self.anchor_conf >= self.anchor_conf.median())
             self.rebuild_scale = float((self.anchor_points.double()[valid].norm(dim=-1) /
