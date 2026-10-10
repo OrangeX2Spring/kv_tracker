@@ -112,16 +112,21 @@ def bridge(old_points, new_points, old_conf, new_conf, old_pose, new_pose):
 
 class MapHandoff:
     def __init__(self, model, mode, log, save_bridge, query_executor=None, native_keyframe_cap=20,
-                 local_keyframe_cap=2):
+                 local_keyframe_cap=2, pin_rebuilds=False):
         # 'reanchor' rebuilds like 'fixed' (anchor + latest) and keeps the first
         # rebuild's anchor geometry for the inter-map connection. Each later rebuild
         # re-normalizes Pi3's scale about the anchor camera; rebuild_scale restores
         # the first rebuild's scale from the anchor pointmap every rebuild shares.
+        # pin_rebuilds additionally removes the rebuild's free rotation/translation
+        # relative to the anchor: the new solution is rigidly moved so its pose of
+        # the refresh frame equals the outgoing bank's pose of that frame.
         assert mode in ('native', 'fixed', 'handoff', 'oracle', 'reanchor')
         assert native_keyframe_cap >= 2
         assert mode == 'native' or native_keyframe_cap == 20
         assert local_keyframe_cap in (2, 3)
         assert mode == 'reanchor' or local_keyframe_cap == 2
+        assert mode == 'reanchor' or not pin_rebuilds
+        self.pin_rebuilds = pin_rebuilds
         self.local_keyframe_cap = local_keyframe_cap
         self.native_keyframe_cap = native_keyframe_cap
         self.model, self.mode, self.log, self.save_bridge = model, mode, log, save_bridge
@@ -265,6 +270,20 @@ class MapHandoff:
             self.rebuild_scale = float((self.anchor_points.double()[valid].norm(dim=-1) /
                                         points[0].double()[valid].norm(dim=-1)).median())
             assert np.isfinite(self.rebuild_scale) and self.rebuild_scale > 0
+        pin = {}
+        if self.pin_rebuilds:
+            # Rebuild poses are already in the anchor-camera frame; queries apply origin.
+            new_pose = poses[-1].double().clone()
+            new_pose[:3, 3] *= self.rebuild_scale
+            old_pose = local_pose.double()
+            rotation = old_pose[:3, :3] @ new_pose[:3, :3].T
+            translation = old_pose[:3, 3] - rotation @ new_pose[:3, 3]
+            self.transform = compose(self.transform, (torch.tensor(1., dtype=torch.float64),
+                                                      rotation, translation))
+            angle = torch.acos(((torch.trace(rotation) - 1) / 2).clamp(-1, 1))
+            # Disagreement between the two banks' poses of this frame (diagnostic).
+            pin = dict(pin_rotation_deg=float(torch.rad2deg(angle)),
+                       pin_position_step=float((old_pose[:3, 3] - new_pose[:3, 3]).norm()))
         self.ids, self.images = ids, images
         self.latest_points, self.latest_conf = points[-1].clone(), conf[-1].clone()
         if self.events and self.events[-1]['frame'] == frame:
@@ -272,5 +291,5 @@ class MapHandoff:
         torch.cuda.synchronize()
         self.log(dict(kind='update_total', frame=frame, seconds=time.perf_counter()-started,
                       cache_bytes=self.cache_bytes(), bank_ids=list(self.ids),
-                      rebuild_scale=self.rebuild_scale))
+                      rebuild_scale=self.rebuild_scale, **pin))
         return global_pose

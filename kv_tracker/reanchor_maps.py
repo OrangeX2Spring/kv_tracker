@@ -15,10 +15,14 @@ from .map_handoff import MapHandoff, bridge, compose
 
 class ReanchorMaps:
     def __init__(self, model, boundaries, log, save_bridge, query_executor=None,
-                 local_keyframe_cap=2):
+                 local_keyframe_cap=2, pin_rebuilds=False):
         self.model, self.boundaries = model, boundaries
         self.query_executor = query_executor
         self.local_keyframe_cap = local_keyframe_cap
+        # Pinning changes the map transform after the anchor geometry used by
+        # connect(); only the single-map (no retirement) configuration uses it.
+        assert not pin_rebuilds or len(boundaries) == 2
+        self.pin_rebuilds = pin_rebuilds
         self.log, self.save_bridge = log, save_bridge
         self.start = 0
         self.tracker = self.new_map(0)
@@ -33,7 +37,7 @@ class ReanchorMaps:
             lambda row: self.log(dict(row, segment_start=start,
                                       global_frame=start + row['frame'])),
             self.save_bridge, query_executor=self.query_executor,
-            local_keyframe_cap=self.local_keyframe_cap)
+            local_keyframe_cap=self.local_keyframe_cap, pin_rebuilds=self.pin_rebuilds)
 
     def step(self, image, frame):
         if frame == 0:
