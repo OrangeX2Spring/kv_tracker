@@ -20,12 +20,17 @@ copy of L's image). One robust, confidence-weighted Sim(3) over both frames' poi
 supplies the scale (VGGT-Diff-style: weight by confidence, require the same points
 to agree across views); rotation and position stay pinned at b. The two frames use
 query-versus-rebuild in opposite directions. Per-frame scales are logged.
+
+latest_anchor keeps the point-fit scale at b but pins rotation and position on L
+instead of b: the old map's pose of L comes from its own joint rebuild, the new map's
+from one camera query of a CPU copy of L's image at b+49. The cut frame b is the old
+map's least-covered frame, so its query pose carries the drift that triggered the cut.
 """
 import weakref
 
 import torch
 
-from .map_handoff import MapHandoff, bridge, compose
+from .map_handoff import MapHandoff, bridge, compose, transform_pose
 
 
 def weighted_similarity(source, target, weight):
@@ -56,7 +61,8 @@ def weighted_similarity(source, target, weight):
 class ReanchorMaps:
     def __init__(self, model, boundaries, log, save_bridge, query_executor=None,
                  local_keyframe_cap=2, pin_rebuilds=False, pin_scale=False, shared_scale=False,
-                 fuse_scale=False, novelty_refresh=None, overlap_stride=None, two_way=False):
+                 fuse_scale=False, novelty_refresh=None, overlap_stride=None, two_way=False,
+                 latest_anchor=False):
         self.model, self.boundaries = model, boundaries
         self.query_executor = query_executor
         self.local_keyframe_cap = local_keyframe_cap
@@ -69,6 +75,8 @@ class ReanchorMaps:
         self.overlap_stride = overlap_stride
         assert not two_way or (overlap_stride is None and not pin_rebuilds)
         self.two_way = two_way
+        assert not latest_anchor or (overlap_stride is None and not two_way and not pin_rebuilds)
+        self.latest_anchor = latest_anchor
         self.pin_rebuilds, self.pin_scale, self.shared_scale = pin_rebuilds, pin_scale, shared_scale
         self.fuse_scale, self.novelty_refresh = fuse_scale, novelty_refresh
         self.log, self.save_bridge = log, save_bridge
@@ -102,12 +110,16 @@ class ReanchorMaps:
             torch.testing.assert_close(pose, old_pose, atol=1e-5, rtol=1e-4)
             old_ids = [self.start + i for i in old.ids]
             latest = None
-            if self.two_way:
+            if self.two_way or self.latest_anchor:
                 # L in the old map's output frame, from its own rebuild; image copied to CPU.
                 assert len(old.ids) >= 2
                 s0, r0, t0 = old.transform
                 latest = dict(frame=old_ids[-1], image=old.images[-1].copy(), conf=old.latest_conf.clone(),
                               points=s0 * ((old.rebuild_scale * old.latest_points.double()) @ r0.T) + t0)
+                if self.latest_anchor:
+                    pose = old.latest_pose.double().clone()
+                    pose[:3, 3] *= old.rebuild_scale
+                    latest['pose'] = transform_pose(pose, old.transform)
             if self.query_executor is not None:
                 self.query_executor.reset()
             overlap = None
@@ -191,7 +203,14 @@ class ReanchorMaps:
             assert all(ref() is None for ref in refs), 'Old KV tensor still referenced'
             assert all(ref() is None for ref in image_refs), 'Old image still referenced'
         latest = pending['latest']
-        if latest is not None:
+        if latest is not None and self.latest_anchor:
+            _, new_latest_pose, _ = self.tracker.query_geometry(latest['image'], frame - self.start)
+            old, new = latest['pose'], new_latest_pose.double()
+            at_b = r
+            r = old[:3, :3] @ new[:3, :3].T
+            event.update(latest_frame=latest['frame'], anchor_disagreement_deg=float(torch.rad2deg(
+                torch.acos(((torch.trace(at_b.T @ r) - 1) / 2).clamp(-1, 1)))))
+        elif latest is not None:
             new_latest, _, new_latest_conf = self.tracker.query_geometry(latest['image'], frame - self.start)
             frames = ((pending['points'], new_points, pending['conf'], self.tracker.anchor_conf),
                       (latest['points'], new_latest, latest['conf'], new_latest_conf))
@@ -216,7 +235,8 @@ class ReanchorMaps:
                      old_ids=pending['old_ids'], new_ids=[self.start + i for i in self.tracker.ids],
                      anchored_rotation=r.tolist(), anchored_translation=anchored[2].tolist(),
                      old_kv_released=True, old_images_released=True,
-                     connection='pose-anchored at b, ' + ('overlap-displacement scale'
+                     connection='pose-anchored at L, point-fit scale at b' if self.latest_anchor else
+                                'pose-anchored at b, ' + ('overlap-displacement scale'
                                 if self.overlap_stride is not None else 'two-way two-frame weighted scale'
                                 if self.two_way else 'point-fit scale'))
         self.save_bridge(event, evidence)
