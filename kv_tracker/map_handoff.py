@@ -112,7 +112,7 @@ def bridge(old_points, new_points, old_conf, new_conf, old_pose, new_pose):
 
 class MapHandoff:
     def __init__(self, model, mode, log, save_bridge, query_executor=None, native_keyframe_cap=20,
-                 local_keyframe_cap=2, pin_rebuilds=False, pin_scale=False):
+                 local_keyframe_cap=2, pin_rebuilds=False, pin_scale=False, shared_scale=False):
         # 'reanchor' rebuilds like 'fixed' (anchor + latest) and keeps the first
         # rebuild's anchor geometry for the inter-map connection. Each later rebuild
         # re-normalizes Pi3's scale about the anchor camera; rebuild_scale restores
@@ -123,6 +123,10 @@ class MapHandoff:
         # pin_scale also replaces the anchor-pointmap scale: rebuild_scale makes the
         # new rebuild's depths of the refresh frame (in its own camera) match the
         # outgoing bank's, read with one dense query before the bank changes.
+        # shared_scale (three-image banks) instead compares the previous keyframe,
+        # a rebuild member of both the outgoing and the new bank, so both depths
+        # are rebuild predictions and no extra forward is needed. The first
+        # rebuild has no shared keyframe and keeps the anchor-defined scale.
         assert mode in ('native', 'fixed', 'handoff', 'oracle', 'reanchor')
         assert native_keyframe_cap >= 2
         assert mode == 'native' or native_keyframe_cap == 20
@@ -130,7 +134,8 @@ class MapHandoff:
         assert mode == 'reanchor' or local_keyframe_cap == 2
         assert mode == 'reanchor' or not pin_rebuilds
         assert pin_rebuilds or not pin_scale
-        self.pin_rebuilds, self.pin_scale = pin_rebuilds, pin_scale
+        assert not shared_scale or (pin_rebuilds and not pin_scale and local_keyframe_cap == 3)
+        self.pin_rebuilds, self.pin_scale, self.shared_scale = pin_rebuilds, pin_scale, shared_scale
         self.local_keyframe_cap = local_keyframe_cap
         self.native_keyframe_cap = native_keyframe_cap
         self.model, self.mode, self.log, self.save_bridge = model, mode, log, save_bridge
@@ -280,6 +285,15 @@ class MapHandoff:
             self.rebuild_scale = float((old_camera[valid].norm(dim=-1) /
                                         new_camera[valid].norm(dim=-1)).median())
             assert np.isfinite(self.rebuild_scale) and self.rebuild_scale > 0
+        elif self.shared_scale and len(ids) == 3:
+            assert ids[1] == self.ids[-1]
+            old_pose, new_pose = self.latest_pose.double(), poses[1].double()
+            old_camera = (self.latest_points.double() - old_pose[:3, 3]) @ old_pose[:3, :3]
+            new_camera = (points[1].double() - new_pose[:3, 3]) @ new_pose[:3, :3]
+            valid = (self.latest_conf >= self.latest_conf.median()) & (conf[1] >= conf[1].median())
+            self.rebuild_scale *= float((old_camera[valid].norm(dim=-1) /
+                                         new_camera[valid].norm(dim=-1)).median())
+            assert np.isfinite(self.rebuild_scale) and self.rebuild_scale > 0
         elif self.mode == 'reanchor' and frame != 49:
             # Both pointmaps are in the anchor camera's frame; only scale differs.
             valid = (conf[0] >= conf[0].median()) & (self.anchor_conf >= self.anchor_conf.median())
@@ -302,6 +316,7 @@ class MapHandoff:
                        pin_position_step=float((old_pose[:3, 3] - new_pose[:3, 3]).norm()))
         self.ids, self.images = ids, images
         self.latest_points, self.latest_conf = points[-1].clone(), conf[-1].clone()
+        self.latest_pose = poses[-1].clone()
         if self.events and self.events[-1]['frame'] == frame:
             self.events[-1]['retained_ids'] = list(self.ids)
         torch.cuda.synchronize()
