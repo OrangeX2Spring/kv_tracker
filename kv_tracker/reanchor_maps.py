@@ -15,14 +15,17 @@ from .map_handoff import MapHandoff, bridge, compose
 
 class ReanchorMaps:
     def __init__(self, model, boundaries, log, save_bridge, query_executor=None,
-                 local_keyframe_cap=2, pin_rebuilds=False, pin_scale=False, shared_scale=False):
+                 local_keyframe_cap=2, pin_rebuilds=False, pin_scale=False, shared_scale=False,
+                 fuse_scale=False, novelty_refresh=None):
         self.model, self.boundaries = model, boundaries
         self.query_executor = query_executor
         self.local_keyframe_cap = local_keyframe_cap
         # Pinning changes the map transform after the anchor geometry used by
         # connect(); only the single-map (no retirement) configuration uses it.
         assert not pin_rebuilds or len(boundaries) == 2
+        assert novelty_refresh is None or len(boundaries) == 2
         self.pin_rebuilds, self.pin_scale, self.shared_scale = pin_rebuilds, pin_scale, shared_scale
+        self.fuse_scale, self.novelty_refresh = fuse_scale, novelty_refresh
         self.log, self.save_bridge = log, save_bridge
         self.start = 0
         self.tracker = self.new_map(0)
@@ -38,11 +41,12 @@ class ReanchorMaps:
                                       global_frame=start + row['frame'])),
             self.save_bridge, query_executor=self.query_executor,
             local_keyframe_cap=self.local_keyframe_cap, pin_rebuilds=self.pin_rebuilds,
-            pin_scale=self.pin_scale, shared_scale=self.shared_scale)
+            pin_scale=self.pin_scale, shared_scale=self.shared_scale, fuse_scale=self.fuse_scale,
+            novelty_refresh=self.novelty_refresh)
 
-    def step(self, image, frame):
+    def step(self, image, frame, mask=None):
         if frame == 0:
-            return self.tracker.bootstrap(image)
+            return self.tracker.bootstrap(image, mask)
         if frame in self.boundaries[1:-1]:
             assert self.pending is None
             old = self.tracker
@@ -68,7 +72,7 @@ class ReanchorMaps:
                                 new_pose=torch.from_numpy(new_pose).double())
             return new_pose
         local = frame - self.start
-        pose = self.tracker.step(image, local)
+        pose = self.tracker.step(image, local, mask=mask)
         if local != 49 or self.pending is None:
             return pose
         self.connect(frame)

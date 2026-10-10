@@ -112,7 +112,8 @@ def bridge(old_points, new_points, old_conf, new_conf, old_pose, new_pose):
 
 class MapHandoff:
     def __init__(self, model, mode, log, save_bridge, query_executor=None, native_keyframe_cap=20,
-                 local_keyframe_cap=2, pin_rebuilds=False, pin_scale=False, shared_scale=False):
+                 local_keyframe_cap=2, pin_rebuilds=False, pin_scale=False, shared_scale=False,
+                 fuse_scale=False, novelty_refresh=None):
         # 'reanchor' rebuilds like 'fixed' (anchor + latest) and keeps the first
         # rebuild's anchor geometry for the inter-map connection. Each later rebuild
         # re-normalizes Pi3's scale about the anchor camera; rebuild_scale restores
@@ -127,6 +128,11 @@ class MapHandoff:
         # a rebuild member of both the outgoing and the new bank, so both depths
         # are rebuild predictions and no extra forward is needed. The first
         # rebuild has no shared keyframe and keeps the anchor-defined scale.
+        # fuse_scale takes the geometric mean of that chained scale and the absolute
+        # anchor-pointmap scale, so per-refresh noise cannot accumulate unboundedly.
+        # novelty_refresh(center, pose, bank_poses) -> bool (native's object keyframe
+        # rule, injected by the caller) adds a rebuild after frame 49 whenever the
+        # current view is novel relative to every bank member; needs object masks.
         assert mode in ('native', 'fixed', 'handoff', 'oracle', 'reanchor')
         assert native_keyframe_cap >= 2
         assert mode == 'native' or native_keyframe_cap == 20
@@ -135,7 +141,10 @@ class MapHandoff:
         assert mode == 'reanchor' or not pin_rebuilds
         assert pin_rebuilds or not pin_scale
         assert not shared_scale or (pin_rebuilds and not pin_scale and local_keyframe_cap == 3)
+        assert not fuse_scale or shared_scale
+        assert novelty_refresh is None or mode == 'reanchor'
         self.pin_rebuilds, self.pin_scale, self.shared_scale = pin_rebuilds, pin_scale, shared_scale
+        self.fuse_scale, self.novelty_refresh = fuse_scale, novelty_refresh
         self.local_keyframe_cap = local_keyframe_cap
         self.native_keyframe_cap = native_keyframe_cap
         self.model, self.mode, self.log, self.save_bridge = model, mode, log, save_bridge
@@ -199,14 +208,27 @@ class MapHandoff:
             self.bank_last_pose = poses[0, -1].cpu().clone()
         return points[0].cpu(), poses[0].cpu(), conf[0, ..., 0].cpu(), origin
 
-    def bootstrap(self, image):
+    def track_object_view(self, points, poses, masks):
+        """Native's novelty inputs in output coordinates: masked object centre, bank poses."""
+        scale, rotation, translation = self.transform
+        assert all(m.shape == p.shape[:2] for p, m in zip(points, masks))
+        selected = torch.cat([p[m] for p, m in zip(points, masks)]).double() * self.rebuild_scale
+        self.object_center = scale * (rotation @ selected.mean(0)) + translation
+        members = poses.double().clone()
+        members[:, :3, 3] *= self.rebuild_scale
+        self.member_poses = torch.stack([transform_pose(m, self.transform) for m in members])
+
+    def bootstrap(self, image, mask=None):
         points, poses, conf, self.origin = self.reconstruct([image, image], [0, 0], 0, 'bootstrap')
         self.transform = (self.transform[0], self.transform[1], -points.mean((0, 1, 2)).double())
         self.ids, self.images = [0], [image]
         self.latest_points, self.latest_conf = points[-1].clone(), conf[-1].clone()
+        if self.novelty_refresh is not None:
+            self.masks = [mask]
+            self.track_object_view(points[:1], poses[:1], self.masks)
         return transform_pose(poses[0], self.transform).float().numpy()
 
-    def step(self, image, frame, update=True, dense_query=False):
+    def step(self, image, frame, update=True, dense_query=False, mask=None):
         torch.cuda.synchronize()
         started = time.perf_counter()
         raw = (pi3_inference(self.model, [image[None]], self.device, cam_only=True, use_cache=True)
@@ -219,7 +241,12 @@ class MapHandoff:
         torch.cuda.synchronize()
         self.log(dict(kind='query', frame=frame, bank_ids=list(self.ids), input_images=1,
                       seconds=time.perf_counter() - started, cache_bytes=self.cache_bytes()))
-        if not update or (self.mode == 'oracle' and frame != 49) or (frame + 1) % 50 or (
+        scheduled, novel = (frame + 1) % 50 == 0, False
+        if self.novelty_refresh is not None:
+            assert mask is not None
+            novel = frame > 49 and not scheduled and bool(self.novelty_refresh(
+                self.object_center, torch.from_numpy(global_pose).double(), self.member_poses))
+        if not update or (self.mode == 'oracle' and frame != 49) or not (scheduled or novel) or (
                 self.mode == 'native' and len(self.ids) >= self.native_keyframe_cap):
             return global_pose
         started = time.perf_counter()
@@ -272,6 +299,8 @@ class MapHandoff:
             if self.local_keyframe_cap == 3 and len(self.ids) > 1:
                 ids.insert(1, self.ids[-1])
                 images.insert(1, self.images[-1])
+            if self.novelty_refresh is not None:
+                masks = [self.masks[0]] + ([self.masks[-1]] if len(ids) == 3 else []) + [mask]
         if self.pin_scale:
             old_points, old_pose, old_conf = self.query_geometry(image, frame)
             # Camera-frame points of the refresh frame, in the outgoing bank's units.
@@ -291,8 +320,15 @@ class MapHandoff:
             old_camera = (self.latest_points.double() - old_pose[:3, 3]) @ old_pose[:3, :3]
             new_camera = (points[1].double() - new_pose[:3, 3]) @ new_pose[:3, :3]
             valid = (self.latest_conf >= self.latest_conf.median()) & (conf[1] >= conf[1].median())
-            self.rebuild_scale *= float((old_camera[valid].norm(dim=-1) /
-                                         new_camera[valid].norm(dim=-1)).median())
+            chain = self.rebuild_scale * float((old_camera[valid].norm(dim=-1) /
+                                                new_camera[valid].norm(dim=-1)).median())
+            if self.fuse_scale:
+                valid = (conf[0] >= conf[0].median()) & (self.anchor_conf >= self.anchor_conf.median())
+                anchor = float((self.anchor_points.double()[valid].norm(dim=-1) /
+                                points[0].double()[valid].norm(dim=-1)).median())
+                scale_sources = dict(anchor_scale=anchor, chain_scale=chain)
+                chain = (anchor * chain) ** .5
+            self.rebuild_scale = chain
             assert np.isfinite(self.rebuild_scale) and self.rebuild_scale > 0
         elif self.mode == 'reanchor' and frame != 49:
             # Both pointmaps are in the anchor camera's frame; only scale differs.
@@ -300,7 +336,7 @@ class MapHandoff:
             self.rebuild_scale = float((self.anchor_points.double()[valid].norm(dim=-1) /
                                         points[0].double()[valid].norm(dim=-1)).median())
             assert np.isfinite(self.rebuild_scale) and self.rebuild_scale > 0
-        pin = {}
+        pin = dict(scale_sources) if self.fuse_scale and len(ids) == 3 else {}
         if self.pin_rebuilds:
             # Rebuild poses are already in the anchor-camera frame; queries apply origin.
             new_pose = poses[-1].double().clone()
@@ -317,6 +353,10 @@ class MapHandoff:
         self.ids, self.images = ids, images
         self.latest_points, self.latest_conf = points[-1].clone(), conf[-1].clone()
         self.latest_pose = poses[-1].clone()
+        if self.novelty_refresh is not None:
+            self.masks = masks
+            self.track_object_view(points, poses, masks)
+            pin['trigger'] = 'schedule' if scheduled else 'novelty'
         if self.events and self.events[-1]['frame'] == frame:
             self.events[-1]['retained_ids'] = list(self.ids)
         torch.cuda.synchronize()
