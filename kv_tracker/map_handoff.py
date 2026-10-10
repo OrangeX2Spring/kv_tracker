@@ -348,7 +348,7 @@ class MapHandoff:
                                                       rotation, translation))
             angle = torch.acos(((torch.trace(rotation) - 1) / 2).clamp(-1, 1))
             # Disagreement between the two banks' poses of this frame (diagnostic).
-            pin = dict(pin_rotation_deg=float(torch.rad2deg(angle)),
+            pin.update(pin_rotation_deg=float(torch.rad2deg(angle)),
                        pin_position_step=float((old_pose[:3, 3] - new_pose[:3, 3]).norm()))
         self.ids, self.images = ids, images
         self.latest_points, self.latest_conf = points[-1].clone(), conf[-1].clone()
