@@ -14,6 +14,9 @@ Cut rules, all causal and from tracker outputs only (no ORB, no GT):
   inside the current camera's view (frustum from the anchor's own pixel rays).
 - 'object_view': when the viewing direction about the object centre (masked anchor
   points) has turned more than `view_degrees` from the anchor's.
+
+An optional ContextProbe (kv_tracker.context_probe) logs, per query, how much the frame
+attends to the cached anchor in every cross-frame layer; it never changes a decision.
 """
 import time
 import weakref
@@ -21,12 +24,13 @@ import weakref
 import numpy as np
 import torch
 
+from .context_probe import token_mask
 from .map_handoff import bridge, transform_pose
 from .pi3_utilts import pi3_inference
 
 
 class AnchorSegments:
-    def __init__(self, model, log, cut, length=48, covisibility=.7, view_degrees=20.):
+    def __init__(self, model, log, cut, length=48, covisibility=.7, view_degrees=20., probe=None):
         assert cut in ('schedule', 'covisibility', 'object_view')
         assert length >= 2 and 0 < covisibility < 1 and 0 < view_degrees < 180
         self.model, self.log, self.cut = model, log, cut
@@ -37,6 +41,7 @@ class AnchorSegments:
         # Runner interface shared with ReanchorMaps: poses are returned already global.
         self.transforms, self.events, self.pending = [self.world], [], None
         self.cuts, self.start = [], 0
+        self.probe = probe
 
     def cache_bytes(self):
         return sum({t.untyped_storage().data_ptr(): t.untyped_storage().nbytes()
@@ -63,6 +68,8 @@ class AnchorSegments:
         if self.cut == 'object_view':
             assert mask is not None and mask.shape == self.anchor_points.shape[:2] and mask.any()
             self.center = self.anchor_points[mask].mean(0)
+        if self.probe is not None:
+            self.probe.set_anchor(None if mask is None else token_mask(mask))
         return pose
 
     def signal(self, local):
@@ -82,6 +89,8 @@ class AnchorSegments:
     def step(self, image, frame, mask=None):
         if frame == 0:
             return transform_pose(self.bootstrap(image, frame, mask), self.world).float().numpy()
+        if self.probe is not None:
+            self.probe.arm(None if mask is None else token_mask(mask))
         torch.cuda.synchronize()
         started = time.perf_counter()
         raw = pi3_inference(self.model, [image[None]], self.device, cam_only=True, use_cache=True)
@@ -89,9 +98,11 @@ class AnchorSegments:
         pose = transform_pose(local, self.world)
         signal = self.signal(local)
         torch.cuda.synchronize()
-        self.log(dict(kind='query', frame=frame, bank_ids=[self.start], input_images=1,
-                      seconds=time.perf_counter() - started, cache_bytes=self.cache_bytes(),
-                      signal=signal))
+        row = dict(kind='query', frame=frame, bank_ids=[self.start], input_images=1,
+                   seconds=time.perf_counter() - started, cache_bytes=self.cache_bytes(), signal=signal)
+        if self.probe is not None:
+            row['context'] = self.probe.result()  # probe time is inside `seconds`
+        self.log(row)
         cut = {'schedule': frame - self.start >= self.length,
                'covisibility': signal is not None and signal < self.covisibility,
                'object_view': signal is not None and signal > self.view_degrees}[self.cut]
