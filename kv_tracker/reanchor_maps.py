@@ -25,9 +25,18 @@ latest_anchor keeps the point-fit scale at b but pins rotation and position on L
 instead of b: the old map's pose of L comes from its own joint rebuild, the new map's
 from one camera query of a CPU copy of L's image at b+49. The cut frame b is the old
 map's least-covered frame, so its query pose carries the drift that triggered the cut.
+
+carry (2026-10-12 pilot) keeps a fraction of L's patches across the cut: chosen by the old
+map's rebuild confidence of L (patch mean) or uniformly at random (seeded per cut), they
+join every bootstrap/rebuild of the new map (MapHandoff carry) until the next cut, when
+the next L replaces them. The connection is unchanged (pinned at b), unless carry_pin,
+which pins rotation and position on L instead: the old map's pose of L from its own
+rebuild, the new map's from its first joint rebuild that contains L's carried patches.
 """
+import math
 import weakref
 
+import numpy as np
 import torch
 
 from .map_handoff import MapHandoff, bridge, compose, transform_pose
@@ -62,7 +71,7 @@ class ReanchorMaps:
     def __init__(self, model, boundaries, log, save_bridge, query_executor=None,
                  local_keyframe_cap=2, pin_rebuilds=False, pin_scale=False, shared_scale=False,
                  fuse_scale=False, novelty_refresh=None, overlap_stride=None, two_way=False,
-                 latest_anchor=False):
+                 latest_anchor=False, carry=None, carry_fraction=.25, carry_seed=0, carry_pin=False):
         self.model, self.boundaries = model, boundaries
         self.query_executor = query_executor
         self.local_keyframe_cap = local_keyframe_cap
@@ -77,6 +86,11 @@ class ReanchorMaps:
         self.two_way = two_way
         assert not latest_anchor or (overlap_stride is None and not two_way and not pin_rebuilds)
         self.latest_anchor = latest_anchor
+        assert carry in (None, 'confidence', 'random') and 0 < carry_fraction < 1
+        assert carry is None or (overlap_stride is None and not two_way and not latest_anchor
+                                 and not pin_rebuilds and local_keyframe_cap == 2 and novelty_refresh is None)
+        assert carry is not None or not carry_pin
+        self.carry, self.carry_fraction, self.carry_seed, self.carry_pin = carry, carry_fraction, carry_seed, carry_pin
         self.pin_rebuilds, self.pin_scale, self.shared_scale = pin_rebuilds, pin_scale, shared_scale
         self.fuse_scale, self.novelty_refresh = fuse_scale, novelty_refresh
         self.log, self.save_bridge = log, save_bridge
@@ -88,14 +102,29 @@ class ReanchorMaps:
         self.pending = None
         self.events = []
 
-    def new_map(self, start):
+    def carried_patches(self, conf, boundary):
+        """Patch keep mask of L from its old rebuild confidence (H, W), or random."""
+        h, w = conf.shape[0] // 14, conf.shape[1] // 14
+        assert conf.shape == (14 * h, 14 * w), conf.shape
+        count = math.ceil(self.carry_fraction * h * w)
+        if self.carry == 'confidence':
+            score = conf.double().reshape(h, 14, w, 14).mean((1, 3)).flatten()
+            chosen = torch.topk(score, count).indices
+        else:
+            chosen = torch.from_numpy(np.random.default_rng([self.carry_seed, boundary]).choice(
+                h * w, count, replace=False))
+        keep = torch.zeros(h * w, dtype=torch.bool)
+        keep[chosen] = True
+        return keep
+
+    def new_map(self, start, carry=None):
         return MapHandoff(self.model, 'reanchor',
             lambda row: self.log(dict(row, segment_start=start,
                                       global_frame=start + row['frame'])),
             self.save_bridge, query_executor=self.query_executor,
             local_keyframe_cap=self.local_keyframe_cap, pin_rebuilds=self.pin_rebuilds,
             pin_scale=self.pin_scale, shared_scale=self.shared_scale, fuse_scale=self.fuse_scale,
-            novelty_refresh=self.novelty_refresh)
+            novelty_refresh=self.novelty_refresh, carry=carry)
 
     def step(self, image, frame, mask=None):
         if frame == 0:
@@ -109,7 +138,15 @@ class ReanchorMaps:
             points, pose, conf = old.query_geometry(image, frame - self.start)
             torch.testing.assert_close(pose, old_pose, atol=1e-5, rtol=1e-4)
             old_ids = [self.start + i for i in old.ids]
-            latest = None
+            latest = carried = None
+            if self.carry is not None:
+                assert len(old.ids) >= 2
+                keep = self.carried_patches(old.latest_conf, frame)
+                carried = dict(image=old.images[-1].copy(), id=old_ids[-1] - frame, keep=keep)
+                if self.carry_pin:
+                    pose = old.latest_pose.double().clone()
+                    pose[:3, 3] *= old.rebuild_scale
+                    latest = dict(frame=old_ids[-1], pose=transform_pose(pose, old.transform))
             if self.two_way or self.latest_anchor:
                 # L in the old map's output frame, from its own rebuild; image copied to CPU.
                 assert len(old.ids) >= 2
@@ -136,11 +173,15 @@ class ReanchorMaps:
                 assert all(ref() is None for ref in refs), 'Old KV tensor still referenced'
                 assert all(ref() is None for ref in image_refs), 'Old image still referenced'
             self.start = frame
-            self.tracker = self.new_map(frame)
+            self.tracker = self.new_map(frame, carried)
             new_pose = self.tracker.bootstrap(image)
             self.pending = dict(old_pose=old_pose, points=points, conf=conf, old_ids=old_ids,
                                 new_pose=torch.from_numpy(new_pose).double(), overlap=overlap,
                                 latest=latest)
+            if carried is not None:
+                self.pending['carry'] = dict(carry_policy=self.carry, carried_frame=old_ids[-1],
+                                             carried_patches=carried['keep'].nonzero()[:, 0].tolist(),
+                                             patches=carried['keep'].numel())
             if overlap is not None:
                 overlap['pairs'] = [(old_pose, self.pending['new_pose'])]
             return new_pose
@@ -203,9 +244,14 @@ class ReanchorMaps:
             assert all(ref() is None for ref in refs), 'Old KV tensor still referenced'
             assert all(ref() is None for ref in image_refs), 'Old image still referenced'
         latest = pending['latest']
-        if latest is not None and self.latest_anchor:
-            _, new_latest_pose, _ = self.tracker.query_geometry(latest['image'], frame - self.start)
-            old, new = latest['pose'], new_latest_pose.double()
+        if latest is not None and (self.latest_anchor or self.carry_pin):
+            if self.carry_pin:
+                new = self.tracker.carry_pose.double().clone()
+                new[:3, 3] *= self.tracker.rebuild_scale
+                new = transform_pose(new, self.tracker.transform)
+            else:
+                _, new, _ = self.tracker.query_geometry(latest['image'], frame - self.start)
+            old, new = latest['pose'], new.double()
             at_b = r
             r = old[:3, :3] @ new[:3, :3].T
             event.update(latest_frame=latest['frame'], anchor_disagreement_deg=float(torch.rad2deg(
@@ -233,9 +279,12 @@ class ReanchorMaps:
         event.update(boundary=self.start, decision_frame=frame, delay_frames=frame - self.start,
                      end_of_video=frame - self.start < 49,
                      old_ids=pending['old_ids'], new_ids=[self.start + i for i in self.tracker.ids],
+                     **pending.get('carry', {}),
                      anchored_rotation=r.tolist(), anchored_translation=anchored[2].tolist(),
                      old_kv_released=True, old_images_released=True,
-                     connection='pose-anchored at L, point-fit scale at b' if self.latest_anchor else
+                     connection='pose-anchored at carried L (joint rebuild), point-fit scale at b'
+                                if self.carry_pin else
+                                'pose-anchored at L, point-fit scale at b' if self.latest_anchor else
                                 'pose-anchored at b, ' + ('overlap-displacement scale'
                                 if self.overlap_stride is not None else 'two-way two-frame weighted scale'
                                 if self.two_way else 'point-fit scale'))

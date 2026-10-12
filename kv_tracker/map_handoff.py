@@ -113,7 +113,7 @@ def bridge(old_points, new_points, old_conf, new_conf, old_pose, new_pose):
 class MapHandoff:
     def __init__(self, model, mode, log, save_bridge, query_executor=None, native_keyframe_cap=20,
                  local_keyframe_cap=2, pin_rebuilds=False, pin_scale=False, shared_scale=False,
-                 fuse_scale=False, novelty_refresh=None):
+                 fuse_scale=False, novelty_refresh=None, carry=None):
         # 'reanchor' rebuilds like 'fixed' (anchor + latest) and keeps the first
         # rebuild's anchor geometry for the inter-map connection. Each later rebuild
         # re-normalizes Pi3's scale about the anchor camera; rebuild_scale restores
@@ -133,6 +133,10 @@ class MapHandoff:
         # novelty_refresh(center, pose, bank_poses) -> bool (native's object keyframe
         # rule, injected by the caller) adds a rebuild after frame 49 whenever the
         # current view is novel relative to every bank member; needs object masks.
+        # carry = dict(image, id, keep): a previous segment's keyframe (id local, negative)
+        # joins every bootstrap/rebuild of this map at position 1 with only its `keep`
+        # patches (h*w bool), so the cache holds those patches; the anchor stays at 0.
+        # reconstruct() inserts it, so its outputs have one extra frame at index 1.
         assert mode in ('native', 'fixed', 'handoff', 'oracle', 'reanchor')
         assert native_keyframe_cap >= 2
         assert mode == 'native' or native_keyframe_cap == 20
@@ -143,6 +147,10 @@ class MapHandoff:
         assert not shared_scale or (pin_rebuilds and not pin_scale and local_keyframe_cap == 3)
         assert not fuse_scale or shared_scale
         assert novelty_refresh is None or mode == 'reanchor'
+        assert carry is None or (mode == 'reanchor' and local_keyframe_cap == 2 and not pin_rebuilds
+                                 and novelty_refresh is None and carry['id'] < 0
+                                 and carry['keep'].dtype == torch.bool and carry['keep'].ndim == 1)
+        self.carry, self.carry_pose = carry, None
         self.pin_rebuilds, self.pin_scale, self.shared_scale = pin_rebuilds, pin_scale, shared_scale
         self.fuse_scale, self.novelty_refresh = fuse_scale, novelty_refresh
         self.local_keyframe_cap = local_keyframe_cap
@@ -188,14 +196,22 @@ class MapHandoff:
                 conf[0, 0, ..., 0].cpu())
 
     def reconstruct(self, images, ids, frame, kind):
+        keep = None
+        if self.carry is not None:
+            keep = torch.ones(len(images) + 1, self.carry['keep'].numel(), dtype=torch.bool)
+            keep[1] = self.carry['keep']
+            images = [images[0], self.carry['image'], *images[1:]]
+            ids = [ids[0], self.carry['id'], *ids[1:]]
         if self.query_executor is not None:
             self.query_executor.reset()
         torch.cuda.synchronize()
         started = time.perf_counter()
         points, poses, conf, _, _, origin = pi3_inference(
-            self.model, [np.stack(images)], self.device, store_cache=True)
+            self.model, [np.stack(images)], self.device, store_cache=True,
+            keep=None if keep is None else keep.to(self.device))
         h, w = images[0].shape[:2]
-        expected_tokens = len(images) * (5 + (h // 14) * (w // 14))
+        expected_tokens = (len(images) * (5 + (h // 14) * (w // 14)) if keep is None else
+                           5 * len(images) + int(keep.sum()))
         assert self.model.cache
         assert all(t.shape[2] == expected_tokens for layer in self.model.cache.values() for t in layer.values())
         torch.cuda.synchronize()
@@ -206,6 +222,8 @@ class MapHandoff:
             self.anchor_conf = conf[0, 0, ..., 0].cpu().clone()
             self.anchor_pose = poses[0, 0].cpu().clone()
             self.bank_last_pose = poses[0, -1].cpu().clone()
+        if self.carry is not None and kind == 'rebuild':
+            self.carry_pose = poses[0, 1].cpu().clone()  # latest rebuild's view of the carried frame
         return points[0].cpu(), poses[0].cpu(), conf[0, ..., 0].cpu(), origin
 
     def track_object_view(self, points, poses, masks):
@@ -219,7 +237,13 @@ class MapHandoff:
         self.member_poses = torch.stack([transform_pose(m, self.transform) for m in members])
 
     def bootstrap(self, image, mask=None):
-        points, poses, conf, self.origin = self.reconstruct([image, image], [0, 0], 0, 'bootstrap')
+        if self.carry is None:
+            points, poses, conf, self.origin = self.reconstruct([image, image], [0, 0], 0, 'bootstrap')
+        else:
+            # [anchor, carried patches] replaces the duplicated anchor; only the anchor's
+            # pointmap (dense) centres the map.
+            points, poses, conf, self.origin = self.reconstruct([image], [0], 0, 'bootstrap')
+            points, conf = points[:1], conf[:1]
         self.transform = (self.transform[0], self.transform[1], -points.mean((0, 1, 2)).double())
         self.ids, self.images = [0], [image]
         self.latest_points, self.latest_conf = points[-1].clone(), conf[-1].clone()
